@@ -1,0 +1,40 @@
+name: st_marys_mass_booking_app
+description: "A Mass Booking App for St. Mary's Church."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.3
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  shared_preferences: ^2.3.2
+  google_sign_in: ^6.3.0
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^6.0.11
+  intl: ^0.19.0
+  uuid: ^4.5.1
+  provider: ^6.1.2
+  http: ^1.2.2
+  image_picker: ^1.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/church-logo.jpg"
+  min_sdk_android: 21
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon.jpg.jpg
+    - assets/church-logo.jpg
