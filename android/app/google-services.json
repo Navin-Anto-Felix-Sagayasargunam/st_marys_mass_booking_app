@@ -14,6 +14,14 @@
       },
       "oauth_client": [
         {
+          "client_id": "761987439619-1nsd7uv69ksimk43e9vkfju853bo68oe.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.st_marys_mass_booking_app",
+            "certificate_hash": "80f1b11a92ecaea29a210644264063d85f10750f"
+          }
+        },
+        {
           "client_id": "761987439619-pdvcmup0c86jab8neote7935kptn86ht.apps.googleusercontent.com",
           "client_type": 3
         }
@@ -29,6 +37,57 @@
             {
               "client_id": "761987439619-pdvcmup0c86jab8neote7935kptn86ht.apps.googleusercontent.com",
               "client_type": 3
+            },
+            {
+              "client_id": "761987439619-4m7rjikhnda678fet1tel69moak02q0u.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.firstflutterApp"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:761987439619:android:c7c185315ba655f3bcc236",
+        "android_client_info": {
+          "package_name": "com.smcc.stmarys.massbooking"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "761987439619-buf677vfbju7m95qbc2g5u3g8b4hh77o.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.smcc.stmarys.massbooking",
+            "certificate_hash": "5881036e83064f6dce10f362bf123241d3d3edd7"
+          }
+        },
+        {
+          "client_id": "761987439619-pdvcmup0c86jab8neote7935kptn86ht.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAxsf_XGpNklj27f5KQzlaHLY7NKSJXvJw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "761987439619-pdvcmup0c86jab8neote7935kptn86ht.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "761987439619-4m7rjikhnda678fet1tel69moak02q0u.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.firstflutterApp"
+              }
             }
           ]
         }

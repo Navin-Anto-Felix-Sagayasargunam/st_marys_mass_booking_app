@@ -754,32 +754,136 @@ class _MainNavigationState extends State<MainNavigation> {
 class InstructionsScreen extends StatelessWidget {
   const InstructionsScreen({super.key});
 
+  static const _instructions = [
+    "All Masses will be celebrated in English (Latin Rite).",
+    "Registration is strictly individual.",
+    "Only adults aged 18+ permitted.",
+    "Access pass required on Sat/Sun.",
+    "Only one Mass per day per person.",
+    "Arrive 30 mins early.",
+  ];
+
   @override
-  Widget build(BuildContext context) => Scaffold(
-      appBar: AppBar(title: const Text("Instructions")),
-      body: Padding(
-          padding: const EdgeInsets.all(25),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text("Important Instructions",
-                style:
-                    TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 20),
-            const Text(
-                "• All Masses will be celebrated in English (Latin Rite).\n"
-                "• Registration is strictly individual.\n"
-                "• Only adults aged 18+ permitted.\n"
-                "• Access pass required on Sat/Sun.\n"
-                "• Only one Mass per day per person.\n"
-                "• Arrive 30 mins early.",
-                style: TextStyle(height: 1.8)),
-            const Spacer(),
-            SizedBox(
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF0F4F8),
+      appBar: AppBar(
+        title: const Text("Instructions"),
+        backgroundColor: const Color(0xFF1E3A5F),
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 24, 20, 24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Header
+              Row(children: [
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E3A5F).withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Icon(Icons.info_outline,
+                      color: Color(0xFF1E3A5F), size: 26),
+                ),
+                const SizedBox(width: 14),
+                const Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text("Important Instructions",
+                        style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF1E3A5F))),
+                    Text("Please read before proceeding",
+                        style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  ],
+                )
+              ]),
+              const SizedBox(height: 20),
+
+              // Instruction Cards
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFDFBF5), // light ivory
+                    borderRadius: BorderRadius.circular(20),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.06),
+                        blurRadius: 16,
+                        offset: const Offset(0, 4),
+                      )
+                    ],
+                  ),
+                  child: ListView.separated(
+                    itemCount: _instructions.length,
+                    separatorBuilder: (_, __) => const Divider(height: 20, color: Color(0xFFE8E0D0)),
+                    itemBuilder: (ctx, i) => Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Container(
+                            width: 8,
+                            height: 8,
+                            decoration: const BoxDecoration(
+                              color: Color(0xFF1E3A5F), // Oxford blue bullet
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Text(
+                            _instructions[i],
+                            style: const TextStyle(
+                                fontSize: 14.5, height: 1.5, color: Color(0xFF2D3748)),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 24),
+
+              // I Agree Button — prominent and visible
+              SizedBox(
                 width: double.infinity,
-                child: ElevatedButton(
-                    onPressed: () => Navigator.pop(context),
-                    child: const Text("I Agree")))
-          ])));
+                height: 56,
+                child: ElevatedButton.icon(
+                  onPressed: () => Navigator.pop(context),
+                  icon: const Icon(Icons.check_circle_outline, size: 22),
+                  label: const Text(
+                    "I Agree & Continue",
+                    style: TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E3A5F),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16)),
+                    elevation: 4,
+                    shadowColor: const Color(0xFF1E3A5F).withOpacity(0.4),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
+
 
 class UserHomeScreen extends StatelessWidget {
   const UserHomeScreen({super.key});
