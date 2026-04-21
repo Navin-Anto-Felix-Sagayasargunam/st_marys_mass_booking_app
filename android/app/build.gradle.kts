@@ -19,7 +19,7 @@ if (keyPropertiesFile.exists()) {
 }
 
 android {
-    namespace = "com.example.st_marys_mass_booking_app"
+    namespace = "com.smcc.stmarys.massbooking"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
