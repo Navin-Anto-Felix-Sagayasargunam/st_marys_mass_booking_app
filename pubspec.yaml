@@ -2,7 +2,7 @@ name: st_marys_mass_booking_app
 description: "A Mass Booking App for St. Mary's Church."
 publish_to: 'none'
 
-version: 1.0.0+3
+version: 1.0.0+4
 
 environment:
   sdk: ^3.11.3

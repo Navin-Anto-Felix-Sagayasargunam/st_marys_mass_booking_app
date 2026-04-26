@@ -3641,10 +3641,81 @@ class _AdminBookForUserScreenState extends State<AdminBookForUserScreen> {
   String? _bookError;
 
   // Form controllers
+  final _f = GlobalKey<FormState>();
+  DateTime? _selectedDob;
+
+  // ── Emirates ID scan state ───────────────────────────────────
+  bool _scanning = false;
+  String? _scanError;
+  File? _scannedImage;
+  double? _scanConfidence;
+
+  Future<void> _scanEmiratesId(ImageSource source) async {
+    setState(() { _scanning = true; _scanError = null; _scannedImage = null; _scanConfidence = null; });
+    try {
+      final picker = ImagePicker();
+      final picked = await picker.pickImage(
+        source: source,
+        imageQuality: 90,
+        preferredCameraDevice: CameraDevice.rear,
+      );
+      if (picked == null) { setState(() => _scanning = false); return; }
+
+      final imageFile = File(picked.path);
+      setState(() => _scannedImage = imageFile);
+
+      final uri = Uri.parse('${ConvexConfig.baseUrl}/extract-id');
+      final request = http.MultipartRequest('POST', uri)
+        ..headers.addAll({
+          'X-Mobile-Auth': 'UIYhkjasd09812ajsdasd143',
+        })
+        ..files.add(await http.MultipartFile.fromPath('image', imageFile.path));
+
+      final streamed = await request.send();
+      final body = await streamed.stream.bytesToString();
+      final json = jsonDecode(body) as Map<String, dynamic>;
+
+      if (streamed.statusCode != 200 || json['ok'] != true) {
+        setState(() {
+          _scanError = json['error']?.toString() ?? 'Could not extract ID details.';
+          _scanning = false;
+        });
+        return;
+      }
+
+      final extractedName   = json['name']?.toString() ?? '';
+      final extractedDob    = json['dob']?.toString() ?? '';   // YYYY-MM-DD
+      final extractedEid    = json['emiratesId']?.toString() ?? ''; // 784-YYYY-XXXXXXX-X
+      final confidence      = (json['confidence'] as num?)?.toDouble();
+
+      if (extractedName.isNotEmpty) _nameCtrl.text = extractedName;
+
+      if (extractedDob.isNotEmpty) {
+        try { _selectedDob = DateTime.parse(extractedDob); } catch (_) {}
+      }
+
+      if (extractedEid.isNotEmpty) {
+        final parts = extractedEid.split('-');
+        if (parts.length == 4) {
+          _eidCtrl.text = '${parts[2]}-${parts[3]}';
+        }
+      }
+
+      setState(() {
+        _scanning = false;
+        _scanConfidence = confidence;
+      });
+    } catch (e) {
+      setState(() {
+        _scanError = 'Scan failed: ${e.toString()}';
+        _scanning = false;
+      });
+    }
+  }
+
   final _nameCtrl = TextEditingController();
   final _emailCtrl = TextEditingController();
   final _mobileCtrl = TextEditingController();
-  final _dobCtrl = TextEditingController();
   final _eidCtrl = TextEditingController();
   final _parishCtrl = TextEditingController();
   final _searchCtrl = TextEditingController();
@@ -3655,7 +3726,7 @@ class _AdminBookForUserScreenState extends State<AdminBookForUserScreen> {
 
   @override
   void dispose() {
-    for (final c in [_nameCtrl,_emailCtrl,_mobileCtrl,_dobCtrl,_eidCtrl,_parishCtrl,_searchCtrl]) c.dispose();
+    for (final c in [_nameCtrl,_emailCtrl,_mobileCtrl,_eidCtrl,_parishCtrl,_searchCtrl]) c.dispose();
     super.dispose();
   }
 
@@ -3664,17 +3735,28 @@ class _AdminBookForUserScreenState extends State<AdminBookForUserScreen> {
     _isExisting = false; _profiles = []; _slots = []; _selectedTemplateId = null;
     _selectedDate = DateTime.now(); _selectedProfileIds = {};
     _bookingResults = []; _bookError = null; _createError = null; _searchError = null;
-    for (final c in [_nameCtrl,_emailCtrl,_mobileCtrl,_dobCtrl,_eidCtrl,_parishCtrl,_searchCtrl]) c.clear();
+    _selectedDob = null;
+    _scanning = false; _scanError = null; _scannedImage = null; _scanConfidence = null;
+    for (final c in [_nameCtrl,_emailCtrl,_mobileCtrl,_eidCtrl,_parishCtrl,_searchCtrl]) c.clear();
   });
 
   Future<void> _createUser() async {
+    if (_f.currentState == null || !_f.currentState!.validate()) return;
+    if (_selectedDob == null) {
+      setState(() => _createError = 'Please select a Date of Birth.');
+      return;
+    }
+
     setState(() { _creatingUser = true; _createError = null; });
     try {
+      final dobStr = DateFormat('yyyy-MM-dd').format(_selectedDob!);
+      final fullEid = '784-${_selectedDob!.year}-${_eidCtrl.text}';
+
       final r = await http.post(Uri.parse('${ConvexConfig.baseUrl}/admin/create-user'),
         headers: ConvexConfig.headers,
         body: jsonEncode({'fullName': _nameCtrl.text.trim(), 'email': _emailCtrl.text.trim(),
-          'mobile': _mobileCtrl.text.trim(), 'dob': _dobCtrl.text.trim(),
-          'idNumber': _eidCtrl.text.trim(), 'parishNumber': _parishCtrl.text.trim()}));
+          'mobile': _mobileCtrl.text.trim(), 'dob': dobStr,
+          'idNumber': fullEid, 'parishNumber': _parishCtrl.text.trim()}));
       final b = jsonDecode(r.body);
       if (b['ok'] == true && mounted) {
         await _loadProfiles(b['ownerUserId'] as String);
@@ -3821,41 +3903,156 @@ class _AdminBookForUserScreenState extends State<AdminBookForUserScreen> {
   }
 
   // ── Step 0: Create or find member ──────────────────────────
-  Widget _buildStep0() => SingleChildScrollView(
-    padding: const EdgeInsets.all(16),
-    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      _sectionCard('Member Information', Icons.person_add_rounded, children: [
-        if (_createError != null) _errorBox(_createError!),
-        _field(_nameCtrl, 'Full Name', required: true),
-        _field(_emailCtrl, 'Email', type: TextInputType.emailAddress),
-        _field(_mobileCtrl, 'Mobile (+971…)', type: TextInputType.phone, required: true),
-        _field(_dobCtrl, 'Date of Birth (YYYY-MM-DD)'),
-        _field(_eidCtrl, 'Emirates ID Number', required: true),
-        _field(_parishCtrl, 'Parish Number (optional)'),
-        const SizedBox(height: 8),
-        SizedBox(width: double.infinity, child: ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14)),
-          onPressed: _creatingUser ? null : _createUser,
-          child: _creatingUser ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text('Create & Continue to Booking'),
-        )),
-      ]),
-      const SizedBox(height: 16),
-      _sectionCard('Or Find Existing Member', Icons.search_rounded, children: [
-        if (_searchError != null) _errorBox(_searchError!),
-        Text('Search by mobile number or email address.', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
-        const SizedBox(height: 12),
-        Row(children: [
-          Expanded(child: TextField(controller: _searchCtrl, decoration: const InputDecoration(hintText: 'Mobile or email…', border: OutlineInputBorder(), contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12)))),
-          const SizedBox(width: 10),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.grey.shade800, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 18)),
-            onPressed: _searching ? null : _searchMember,
-            child: _searching ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text('Search'),
-          ),
+  Widget _buildStep0() {
+    Widget fieldLabel(String text) => Padding(
+      padding: const EdgeInsets.only(bottom: 8, top: 12),
+      child: Text(text, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF1E3A5F))),
+    );
+
+    InputDecoration inputStyle({String? hint, Color? fill}) => InputDecoration(
+      hintText: hint, filled: true, fillColor: fill ?? Colors.grey.shade50,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+      enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.grey.shade300)),
+      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: const Color(0xFF1E3A5F), width: 1.5)),
+      errorBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.red.shade300)),
+      disabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+    );
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Form(
+        key: _f,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          _sectionCard('Member Information', Icons.person_add_rounded, children: [
+            if (_createError != null) _errorBox(_createError!),
+            
+            // ── Scanning UI ──────────────────────────────────────────────
+            Container(
+              decoration: BoxDecoration(color: const Color(0xFFEEF2FF), borderRadius: BorderRadius.circular(14), border: Border.all(color: const Color(0xFFBFCBF5))),
+              padding: const EdgeInsets.all(14),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                const Row(children: [
+                  Icon(Icons.credit_card, color: Color(0xFF1E3A5F), size: 18), SizedBox(width: 8),
+                  Text('Scan Emirates ID (optional)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF1E3A5F))),
+                ]),
+                const SizedBox(height: 4),
+                const Text('Take a photo or upload the front of the Emirates ID to auto-fill details.', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                const SizedBox(height: 10),
+                if (!_scanning) Row(children: [
+                  Expanded(child: OutlinedButton.icon(
+                    icon: const Icon(Icons.camera_alt, size: 16), label: const Text('Camera', style: TextStyle(fontSize: 13)),
+                    style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFF1E3A5F), side: const BorderSide(color: Color(0xFF1E3A5F)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)), padding: const EdgeInsets.symmetric(vertical: 10)),
+                    onPressed: () => _scanEmiratesId(ImageSource.camera),
+                  )),
+                  const SizedBox(width: 10),
+                  Expanded(child: OutlinedButton.icon(
+                    icon: const Icon(Icons.photo_library, size: 16), label: const Text('Gallery', style: TextStyle(fontSize: 13)),
+                    style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFF1E3A5F), side: const BorderSide(color: Color(0xFF1E3A5F)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)), padding: const EdgeInsets.symmetric(vertical: 10)),
+                    onPressed: () => _scanEmiratesId(ImageSource.gallery),
+                  )),
+                ]),
+                if (_scanning) const Row(children: [
+                  SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)), SizedBox(width: 10),
+                  Text('Extracting details…', style: TextStyle(fontSize: 13, color: Color(0xFF1E3A5F))),
+                ]),
+                if (_scannedImage != null && !_scanning) ...[
+                  const SizedBox(height: 8),
+                  ClipRRect(borderRadius: BorderRadius.circular(10), child: Image.file(_scannedImage!, height: 120, fit: BoxFit.cover, width: double.infinity)),
+                ],
+                if (_scanConfidence != null && !_scanning) ...[
+                  const SizedBox(height: 6),
+                  Row(children: [
+                    const Icon(Icons.check_circle, color: Colors.green, size: 14), const SizedBox(width: 4),
+                    Text('Auto-filled with ${(_scanConfidence! * 100).toStringAsFixed(0)}% confidence.', style: const TextStyle(fontSize: 11, color: Colors.green)),
+                  ]),
+                ],
+                if (_scanError != null) ...[
+                  const SizedBox(height: 6),
+                  Row(children: [
+                    const Icon(Icons.warning_amber, color: Colors.red, size: 14), const SizedBox(width: 4),
+                    Expanded(child: Text(_scanError!, style: const TextStyle(fontSize: 11, color: Colors.red))),
+                  ]),
+                ],
+              ]),
+            ),
+            const SizedBox(height: 10),
+            
+            fieldLabel("Full Name *"),
+            TextFormField(controller: _nameCtrl, decoration: inputStyle(hint: "Enter full name"), validator: (v) => v == null || v.isEmpty ? "Required field" : null),
+            
+            fieldLabel("Email"),
+            TextFormField(controller: _emailCtrl, keyboardType: TextInputType.emailAddress, decoration: inputStyle(hint: "Enter email"), validator: (v) {
+              if (v == null || v.isEmpty) return null;
+              return RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$').hasMatch(v) ? null : "Invalid email address";
+            }),
+            
+            fieldLabel("Mobile Number (+971...) *"),
+            TextFormField(controller: _mobileCtrl, keyboardType: TextInputType.phone, decoration: inputStyle(hint: "+9715..."), validator: (v) {
+              if (v == null || v.isEmpty) return "Required field";
+              return RegExp(r'^\+9715[0-9]{8}$').hasMatch(v) ? null : "Must be in format +9715XXXXXXXX";
+            }),
+            
+            fieldLabel("Date of Birth *"),
+            InkWell(
+              onTap: () async {
+                final dt = await showDatePicker(context: context, initialDate: _selectedDob ?? DateTime(2000), firstDate: DateTime(1920), lastDate: DateTime.now());
+                if (dt != null) setState(() => _selectedDob = dt);
+              },
+              borderRadius: BorderRadius.circular(12),
+              child: InputDecorator(
+                decoration: inputStyle(fill: Colors.grey.shade50).copyWith(
+                  errorText: (_selectedDob == null && _f.currentState != null && !(_f.currentState!.validate())) ? "Please select a date" : null,
+                ),
+                child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                  Text(_selectedDob == null ? "Select Date" : DateFormat('dd/MM/yyyy').format(_selectedDob!), style: TextStyle(color: _selectedDob == null ? Colors.grey.shade600 : Colors.black87, fontSize: 16)),
+                  Icon(Icons.calendar_month, color: Colors.grey.shade600),
+                ]),
+              ),
+            ),
+            
+            fieldLabel("Emirates ID *"),
+            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(flex: 3, child: TextFormField(key: ValueKey(_selectedDob?.year), initialValue: "784-${_selectedDob?.year ?? 'YYYY'}-", enabled: false, decoration: inputStyle(fill: Colors.grey.shade200))),
+              const SizedBox(width: 12),
+              Expanded(flex: 5, child: TextFormField(
+                controller: _eidCtrl, decoration: inputStyle(hint: "1234567-1"), keyboardType: TextInputType.number, maxLength: 9,
+                validator: (v) => RegExp(r'^[0-9]{7}-[0-9]{1}$').hasMatch(v ?? "") ? null : "Must be XXXXXXX-X",
+                onChanged: (v) {
+                  if (v.length == 7 && !v.contains("-")) { _eidCtrl.text = "$v-"; _eidCtrl.selection = TextSelection.fromPosition(TextPosition(offset: _eidCtrl.text.length)); }
+                },
+              )),
+            ]),
+            
+            fieldLabel("Parish Number (optional)"),
+            TextFormField(controller: _parishCtrl, textCapitalization: TextCapitalization.characters, decoration: inputStyle(hint: "e.g. envelope or register number")),
+            
+            const SizedBox(height: 16),
+            SizedBox(width: double.infinity, child: ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14)),
+              onPressed: _creatingUser ? null : _createUser,
+              child: _creatingUser ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text('Create & Continue to Booking'),
+            )),
+          ]),
+          const SizedBox(height: 16),
+          _sectionCard('Or Find Existing Member', Icons.search_rounded, children: [
+            if (_searchError != null) _errorBox(_searchError!),
+            Text('Search by mobile number or email address.', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
+            const SizedBox(height: 12),
+            Row(children: [
+              Expanded(child: TextField(controller: _searchCtrl, decoration: const InputDecoration(hintText: 'Mobile or email…', border: OutlineInputBorder(), contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12)))),
+              const SizedBox(width: 10),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.grey.shade800, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 18)),
+                onPressed: _searching ? null : _searchMember,
+                child: _searching ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text('Search'),
+              ),
+            ]),
+          ]),
         ]),
-      ]),
-    ]),
-  );
+      ),
+    );
+  }
 
   // ── Step 1: After create — two options ─────────────────────
   Widget _buildStep1() => SingleChildScrollView(
