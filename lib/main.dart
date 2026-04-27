@@ -1636,6 +1636,7 @@ class _BookMassScreenState extends State<BookMassScreen> {
   List<dynamic> _publishedMasses = [];  // concrete slots for the selected date
   bool _allowAnyDay = false;            // mirrors allowAnyDayWeekendScheduleBooking
   bool _flagLoading = true;             // shows spinner until flag is fetched
+  List<dynamic> _availabilityRules = []; // mirrors massAvailability rules
 
   @override
   void initState() {
@@ -1668,6 +1669,7 @@ class _BookMassScreenState extends State<BookMassScreen> {
           if (mounted) {
             setState(() {
               _allowAnyDay = allowAny;
+              _availabilityRules = List<dynamic>.from(body['availabilityRules'] ?? []);
               _flagLoading = false;
               dt = initialDate;
             });
@@ -1710,6 +1712,7 @@ class _BookMassScreenState extends State<BookMassScreen> {
           availableSlots = slots;
           _publishedMasses = List<dynamic>.from(body['publishedMasses'] ?? []);
           _allowAnyDay = body['allowAnyDayWeekendScheduleBooking'] == true;
+          _availabilityRules = List<dynamic>.from(body['availabilityRules'] ?? []);
         });
       }
     }
@@ -2176,12 +2179,27 @@ class _BookMassScreenState extends State<BookMassScreen> {
                 lastDate: DateTime.now().add(const Duration(days: 60)),
                 // Gap 1: when allowAnyDay=true, all days selectable (weekday masses)
                 //         when false, only Sat/Sun (weekend masses)
-                selectableDayPredicate: _allowAnyDay
-                    ? null
-                    : (DateTime day) {
-                        return day.weekday == DateTime.saturday ||
-                            day.weekday == DateTime.sunday;
-                      },
+                selectableDayPredicate: (DateTime day) {
+                  // 1. Basic day of week validation
+                  if (!_allowAnyDay && day.weekday != DateTime.saturday && day.weekday != DateTime.sunday) {
+                    return false;
+                  }
+                  // 2. Validate against Mass Availability rules
+                  if (_availabilityRules.isEmpty) {
+                    return true;
+                  }
+                  final ymd = DateFormat('yyyy-MM-dd').format(day);
+                  bool allowed = false;
+                  for (var rule in _availabilityRules) {
+                    final start = rule['startDate'] as String;
+                    final end = rule['endDate'] as String;
+                    if (ymd.compareTo(start) >= 0 && ymd.compareTo(end) <= 0) {
+                      allowed = true;
+                      break;
+                    }
+                  }
+                  return allowed;
+                },
                 onDateChanged: (d) {
                   setState(() {
                     dt = d;
