@@ -22,6 +22,14 @@
           }
         },
         {
+          "client_id": "761987439619-eqsir1rbpf1oibt24ik76vjus3q7g0nc.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.smcc.stmarys.massbooking",
+            "certificate_hash": "385a1aadfc22131b8224a234e5fb1384072b3211"
+          }
+        },
+        {
           "client_id": "761987439619-pdvcmup0c86jab8neote7935kptn86ht.apps.googleusercontent.com",
           "client_type": 3
         }

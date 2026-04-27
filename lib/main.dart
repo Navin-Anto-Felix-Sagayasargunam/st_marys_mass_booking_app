@@ -27,6 +27,7 @@ class ConvexConfig {
     "X-Mobile-Auth": "UIYhkjasd09812ajsdasd143",
     "Content-Type": "application/json",
   };
+  static const String googleOAuthWebClientId = "299520186917-hsrup359ckb81ud1g565o2kh83oa3boa.apps.googleusercontent.com";
 }
 
 // ─── MODELS ──────────────────────────────────────────────────
@@ -204,8 +205,7 @@ class AppState extends ChangeNotifier {
       // serverClientId MUST match AUTH_GOOGLE_ID on Convex so Android
       // mints an idToken with the correct audience.
       final GoogleSignInAccount? googleUser = await GoogleSignIn(
-        serverClientId:
-            '299520186917-hsrup359ckb81ud1g565o2kh83oa3boa.apps.googleusercontent.com',
+        serverClientId: ConvexConfig.googleOAuthWebClientId,
       ).signIn();
 
       if (googleUser == null) {
@@ -1626,16 +1626,57 @@ class BookMassScreen extends StatefulWidget {
 }
 
 class _BookMassScreenState extends State<BookMassScreen> {
-  DateTime dt = (DateTime.now().weekday == DateTime.saturday || DateTime.now().weekday == DateTime.sunday) ? DateTime.now() : DateTime.now().add(Duration(days: 6 - DateTime.now().weekday));
-  String? tm;
+  // Selected date — defaults to today; corrected once flag is loaded
+  DateTime dt = DateTime.now();
   String? templateId;
   List<String> selectedProfiles = [];
   List<dynamic> availableSlots = [];
 
+  // ── New state for parity with web ────────────────────────────
+  List<dynamic> _publishedMasses = [];  // concrete slots for the selected date
+  bool _allowAnyDay = false;            // mirrors allowAnyDayWeekendScheduleBooking
+  bool _flagLoading = true;             // shows spinner until flag is fetched
+
   @override
   void initState() {
     super.initState();
-    _fetchSlots();
+    _fetchInitialFlagThenSlots();
+  }
+
+  /// Probes the API with the upcoming Saturday to get allowAnyDay flag,
+  /// then sets the correct initial date and fetches slots for it.
+  Future<void> _fetchInitialFlagThenSlots() async {
+    final now = DateTime.now();
+    int daysToSat = DateTime.saturday - now.weekday;
+    if (daysToSat <= 0) daysToSat += 7;
+    final probeSat = now.add(Duration(days: daysToSat));
+    try {
+      final res = await http.get(
+        Uri.parse("${ConvexConfig.baseUrl}/mass-schedule/times?parishDateYmd=${DateFormat('yyyy-MM-dd').format(probeSat)}"),
+        headers: ConvexConfig.headers,
+      );
+      if (res.statusCode == 200 && mounted) {
+        final body = jsonDecode(res.body);
+        if (body['ok'] == true) {
+          final allowAny = body['allowAnyDayWeekendScheduleBooking'] == true;
+          // When any day is allowed, default to today; otherwise upcoming Saturday
+          final initialDate = allowAny
+              ? now
+              : (now.weekday == DateTime.saturday || now.weekday == DateTime.sunday)
+                  ? now
+                  : now.add(Duration(days: DateTime.saturday - now.weekday));
+          if (mounted) {
+            setState(() {
+              _allowAnyDay = allowAny;
+              _flagLoading = false;
+              dt = initialDate;
+            });
+          }
+        }
+      }
+    } catch (_) {}
+    if (mounted && _flagLoading) setState(() => _flagLoading = false);
+    await _fetchSlots();
   }
 
   int _timeToMinutes(String timeStr) {
@@ -1659,17 +1700,421 @@ class _BookMassScreenState extends State<BookMassScreen> {
       Uri.parse("${ConvexConfig.baseUrl}/mass-schedule/times?parishDateYmd=${DateFormat('yyyy-MM-dd').format(dt)}"),
       headers: ConvexConfig.headers,
     );
-    if (res.statusCode == 200) {
-      setState(() {
-        final List<dynamic> slots = jsonDecode(res.body)['templateTimesForDay'] ?? [];
+    if (res.statusCode == 200 && mounted) {
+      final body = jsonDecode(res.body);
+      if (body['ok'] == true) {
+        final List<dynamic> slots = body['templateTimesForDay'] ?? [];
         slots.sort((a, b) => _timeToMinutes(a['time']?.toString() ?? '')
             .compareTo(_timeToMinutes(b['time']?.toString() ?? '')));
-        availableSlots = slots;
-      });
+        setState(() {
+          availableSlots = slots;
+          _publishedMasses = List<dynamic>.from(body['publishedMasses'] ?? []);
+          _allowAnyDay = body['allowAnyDayWeekendScheduleBooking'] == true;
+        });
+      }
     }
   }
 
+  /// Finds the published mass slot matching a template entry by language + time.
+  dynamic _findPublishedMass(String language, String templateTime) {
+    for (final pm in _publishedMasses) {
+      if (pm['language']?.toString() != language) continue;
+      final startMs = pm['startDateTime'];
+      if (startMs is int) {
+        final pmLocal = DateTime.fromMillisecondsSinceEpoch(startMs).toLocal();
+        final h = pmLocal.hour;
+        final m = pmLocal.minute;
+        final period = h >= 12 ? 'PM' : 'AM';
+        final h12 = h > 12 ? h - 12 : (h == 0 ? 12 : h);
+        final formatted = "${h12.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')} $period";
+        if (formatted == templateTime) return pm;
+      }
+      if ((pm['label']?.toString() ?? '').contains(templateTime)) return pm;
+    }
+    return null;
+  }
+
+  /// Returns true if the mass time has already passed.
+  bool _isTimePassed(dynamic publishedMass) {
+    if (publishedMass == null) return false;
+    final startMs = publishedMass['startDateTime'];
+    if (startMs is int) return DateTime.fromMillisecondsSinceEpoch(startMs).isBefore(DateTime.now());
+    return false;
+  }
+
+  /// Returns true if the user already has a booking for this slot.
+  bool _isAlreadyBooked(dynamic publishedMass, List<MassBooking> myBookings) {
+    if (publishedMass == null) return false;
+    final startMs = publishedMass['startDateTime'];
+    if (startMs == null) return false;
+    return myBookings.any((b) => b.startDateTime.millisecondsSinceEpoch == startMs);
+  }
+
+  List<Widget> _buildGroupedTimeSlots(List<dynamic> slots, List<MassBooking> myBookings) {
+    if (slots.isEmpty) {
+      return [
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 12),
+          child: Text(
+            "No Mass times available for this date.",
+            style: TextStyle(color: Colors.grey, fontStyle: FontStyle.italic),
+          ),
+        )
+      ];
+    }
+
+    Color langColor(String lang) {
+      switch (lang.toLowerCase()) {
+        case 'english':   return const Color(0xFF1E3A5F);
+        case 'tamil':     return const Color(0xFF2E7D32);
+        case 'malayalam': return const Color(0xFF6A1B9A);
+        case 'hindi':     return const Color(0xFFE65100);
+        case 'arabic':    return const Color(0xFF00695C);
+        case 'konkani':   return const Color(0xFF4527A0);
+        default:          return const Color(0xFF37474F);
+      }
+    }
+
+    String categoryLabel(String cat) {
+      switch (cat.toLowerCase()) {
+        case 'weekend': return '⛪  Weekend Masses';
+        case 'weekday': return '🕐  Weekday Masses';
+        default:        return '✨  Special Services';
+      }
+    }
+
+    Color categoryColor(String cat) {
+      switch (cat.toLowerCase()) {
+        case 'weekend': return const Color(0xFFF9A825);
+        case 'weekday': return const Color(0xFF1565C0);
+        default:        return const Color(0xFF6A1B9A);
+      }
+    }
+
+    // Group by category → language → location
+    final Map<String, Map<String, Map<String, List<dynamic>>>> grouped = {};
+    for (final slot in slots) {
+      final cat  = slot['category']?.toString() ?? 'Other';
+      final lang = slot['language']?.toString() ?? 'English';
+      final loc  = slot['location']?.toString() ?? '';
+      grouped.putIfAbsent(cat, () => {});
+      grouped[cat]!.putIfAbsent(lang, () => {});
+      grouped[cat]![lang]!.putIfAbsent(loc, () => []);
+      grouped[cat]![lang]![loc]!.add(slot);
+    }
+
+    final catOrder = ['Weekend', 'Weekday', 'Other'];
+    final sortedCats = grouped.keys.toList()
+      ..sort((a, b) {
+        final ai = catOrder.indexWhere((c) => c.toLowerCase() == a.toLowerCase());
+        final bi = catOrder.indexWhere((c) => c.toLowerCase() == b.toLowerCase());
+        return (ai < 0 ? 99 : ai).compareTo(bi < 0 ? 99 : bi);
+      });
+
+    final widgets = <Widget>[];
+
+    for (final cat in sortedCats) {
+      final languages  = grouped[cat]!;
+      final catColor   = categoryColor(cat);
+      final catLabel   = categoryLabel(cat);
+
+      // ── Category divider header ─────────────────────────────
+      widgets.add(Padding(
+        padding: const EdgeInsets.only(top: 18, bottom: 10),
+        child: Row(children: [
+          Expanded(child: Divider(color: catColor.withOpacity(0.3), thickness: 1)),
+          const SizedBox(width: 10),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            decoration: BoxDecoration(
+              color: catColor.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: catColor.withOpacity(0.4)),
+            ),
+            child: Text(catLabel,
+                style: TextStyle(color: catColor, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 0.4)),
+          ),
+          const SizedBox(width: 10),
+          Expanded(child: Divider(color: catColor.withOpacity(0.3), thickness: 1)),
+        ]),
+      ));
+
+      languages.forEach((language, locations) {
+        final lColor = langColor(language);
+
+        // ── Language pill with globe icon ───────────────────────
+        widgets.add(Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: Row(children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: lColor,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [BoxShadow(color: lColor.withOpacity(0.3), blurRadius: 6, offset: const Offset(0, 2))],
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                const Icon(Icons.language, color: Colors.white, size: 12),
+                const SizedBox(width: 5),
+                Text(language,
+                    style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 0.3)),
+              ]),
+            ),
+          ]),
+        ));
+
+        locations.forEach((location, locSlots) {
+          // ── Location chip ─────────────────────────────────────
+          if (location.isNotEmpty) {
+            widgets.add(Padding(
+              padding: const EdgeInsets.only(left: 2, bottom: 10),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.grey.shade300),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.apartment_rounded, size: 13, color: Colors.grey.shade600),
+                  const SizedBox(width: 5),
+                  Text(location,
+                      style: TextStyle(fontSize: 12, color: Colors.grey.shade700, fontWeight: FontWeight.w600)),
+                ]),
+              ),
+            ));
+          }
+
+          // ── Time cards ────────────────────────────────────────
+          widgets.add(Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: locSlots.map((slot) {
+              final slotId     = slot['id']?.toString() ?? '';
+              final time       = slot['time']?.toString() ?? '';
+              final obligatory = slot['obligatory']?.toString() ?? '';
+              final event      = slot['event']?.toString();
+              final repeat     = slot['repeat']?.toString();
+              final type       = slot['type']?.toString();
+              final isSelected    = templateId != null && templateId == slotId;
+              final isObligatory  = obligatory == 'Obligatory';
+              final isOneTime     = type == 'one-time';
+              final showRepeat    = repeat != null && repeat != 'None' && !isOneTime;
+
+              // ── Availability checks — all from API response ───
+              final publishedMass      = _findPublishedMass(language, time);
+              final timePassed         = _isTimePassed(publishedMass);
+              final alreadyBooked      = _isAlreadyBooked(publishedMass, myBookings);
+              final isFullyBooked      = publishedMass?['isFullyBooked'] == true;
+              final isWindowOpen       = publishedMass == null
+                  ? true  // template-only slot: always open
+                  : publishedMass['isBookingWindowOpen'] != false;
+              final remaining          = publishedMass?['remaining'] as int?;
+              final bookingOpenAt      = publishedMass?['bookingOpenAt'] as int?;
+              final isDisabled         = timePassed || alreadyBooked || isFullyBooked || !isWindowOpen;
+              final showLowSeats       = !isDisabled && remaining != null && remaining <= 10 && remaining > 0;
+
+              // Opens-on date string for closed-window slots
+              String? opensOnLabel;
+              if (!isWindowOpen && bookingOpenAt != null && bookingOpenAt > 0) {
+                final opensDate = DateTime.fromMillisecondsSinceEpoch(bookingOpenAt).toLocal();
+                opensOnLabel = "Opens ${opensDate.day}/${opensDate.month} ${opensDate.hour.toString().padLeft(2,'0')}:${opensDate.minute.toString().padLeft(2,'0')}";
+              }
+
+              // Card color based on state priority
+              final cardColor = timePassed
+                  ? Colors.grey.shade100
+                  : isFullyBooked
+                      ? Colors.red.shade50
+                      : !isWindowOpen
+                          ? Colors.orange.shade50
+                          : alreadyBooked
+                              ? Colors.green.shade50
+                              : isSelected
+                                  ? lColor
+                                  : Colors.white;
+              final borderColor = timePassed
+                  ? Colors.grey.shade300
+                  : isFullyBooked
+                      ? Colors.red.shade300
+                      : !isWindowOpen
+                          ? Colors.orange.shade300
+                          : alreadyBooked
+                              ? Colors.green.shade300
+                              : isSelected
+                                  ? lColor
+                                  : (isOneTime ? Colors.purple.shade200 : Colors.grey.shade300);
+              final textColor = timePassed
+                  ? Colors.grey.shade400
+                  : isFullyBooked
+                      ? Colors.red.shade400
+                      : !isWindowOpen
+                          ? Colors.orange.shade700
+                          : alreadyBooked
+                              ? Colors.green.shade700
+                              : isSelected
+                                  ? Colors.white
+                                  : lColor;
+
+              return GestureDetector(
+                onTap: isDisabled ? null : () => setState(() => templateId = isSelected ? null : slotId),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+                  decoration: BoxDecoration(
+                    color: cardColor,
+                    border: Border.all(color: borderColor, width: isSelected ? 2 : (isOneTime ? 1.5 : 1)),
+                    borderRadius: BorderRadius.circular(14),
+                    boxShadow: isSelected
+                        ? [BoxShadow(color: lColor.withOpacity(0.3), blurRadius: 10, offset: const Offset(0, 4))]
+                        : [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 4, offset: const Offset(0, 2))],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Already booked badge (Gap 4)
+                      if (alreadyBooked)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          margin: const EdgeInsets.only(bottom: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.green.shade100,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            Icon(Icons.check_circle, size: 10, color: Colors.green.shade700),
+                            const SizedBox(width: 3),
+                            Text('Booked ✓', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.green.shade800)),
+                          ]),
+                        ),
+                      // Fully booked badge (new — from API capacity)
+                      if (isFullyBooked && !alreadyBooked)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          margin: const EdgeInsets.only(bottom: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.red.shade100,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            Icon(Icons.block, size: 10, color: Colors.red.shade700),
+                            const SizedBox(width: 3),
+                            Text('Full', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.red.shade800)),
+                          ]),
+                        ),
+                      // Booking window not yet open badge (new — from API bookingOpenAt)
+                      if (!isWindowOpen && !isFullyBooked && !alreadyBooked)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          margin: const EdgeInsets.only(bottom: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.orange.shade100,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            Icon(Icons.lock_clock, size: 10, color: Colors.orange.shade800),
+                            const SizedBox(width: 3),
+                            Text(opensOnLabel ?? 'Not open yet',
+                                style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.orange.shade900)),
+                          ]),
+                        ),
+                      // Time passed badge (Gap 3)
+                      if (timePassed && !alreadyBooked && !isFullyBooked)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          margin: const EdgeInsets.only(bottom: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.grey.shade200,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text('Passed', style: TextStyle(fontSize: 10, color: Colors.grey.shade500)),
+                        ),
+                      if (isOneTime)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                          margin: const EdgeInsets.only(bottom: 4),
+                          decoration: BoxDecoration(
+                            color: isSelected ? Colors.purple.shade200 : Colors.purple.shade50,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text('One-Time',
+                              style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold,
+                                  color: Colors.purple.shade800, letterSpacing: 0.3)),
+                        ),
+                      Text(time,
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16,
+                              color: textColor, letterSpacing: 0.2,
+                              decoration: timePassed ? TextDecoration.lineThrough : null)),
+                      if (showRepeat) ...[
+                        const SizedBox(height: 3),
+                        Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.repeat, size: 10,
+                              color: isSelected ? Colors.white60 : Colors.grey.shade400),
+                          const SizedBox(width: 3),
+                          Text(repeat,
+                              style: TextStyle(fontSize: 10,
+                                  color: isSelected ? Colors.white60 : Colors.grey.shade400)),
+                        ]),
+                      ],
+                      // Low seats warning (new — from API remaining count)
+                      if (showLowSeats) ...[
+                        const SizedBox(height: 3),
+                        Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.event_seat, size: 10, color: Colors.amber.shade700),
+                          const SizedBox(width: 3),
+                          Text('$remaining left',
+                              style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600,
+                                  color: Colors.amber.shade800)),
+                        ]),
+                      ],
+                      if (isObligatory || event != null) ...[
+                        const SizedBox(height: 6),
+                        Wrap(spacing: 4, runSpacing: 3, children: [
+                          if (isObligatory)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: isSelected ? Colors.amber.shade300 : Colors.amber.shade100,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text('Obligatory',
+                                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold,
+                                      color: Colors.amber.shade900)),
+                            ),
+                          if (event != null)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: isSelected ? Colors.orange.shade300 : Colors.orange.shade100,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                Icon(Icons.star_rounded, size: 9, color: Colors.orange.shade800),
+                                const SizedBox(width: 3),
+                                Text(event,
+                                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold,
+                                        color: Colors.orange.shade900)),
+                              ]),
+                            ),
+                        ]),
+                      ],
+                    ],
+                  ),
+                ),
+              );
+            }).toList(),
+          ));
+          widgets.add(const SizedBox(height: 10));
+        });
+      });
+    }
+
+    return widgets;
+  }
+
   @override
+
   Widget build(BuildContext context) {
     final s = context.watch<AppState>();
     return SingleChildScrollView(
@@ -1718,45 +2163,40 @@ class _BookMassScreenState extends State<BookMassScreen> {
           const SizedBox(height: 20),
           const Text("2. Select Date",
               style: TextStyle(fontWeight: FontWeight.bold)),
-          CalendarDatePicker(
-              initialDate: dt,
-              firstDate: DateTime.now(),
-              lastDate: DateTime.now().add(const Duration(days: 30)),
-              selectableDayPredicate: (DateTime day) {
-                // 1. Only Sat/Sun allowed
-                if (day.weekday != DateTime.saturday && day.weekday != DateTime.sunday) {
-                  return false;
-                }
-                
-                // 2. Determine the exact Monday before this targeted weekend
-                final openingMonday = day.subtract(Duration(days: day.weekday - 1));
-                
-                // 3. Only unlock if today is on/after that specific Monday
-                final now = DateTime.now();
-                final today = DateTime(now.year, now.month, now.day);
-                final openingMondayDate = DateTime(openingMonday.year, openingMonday.month, openingMonday.day);
-                
-                return !today.isBefore(openingMondayDate);
-              },
-              onDateChanged: (d) {
-                setState(() {
-                  dt = d;
-                  tm = null;
-                });
-                _fetchSlots();
-              }),
+          if (_flagLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else
+            CalendarDatePicker(
+                initialDate: dt,
+                firstDate: DateTime.now(),
+                // Gap 2: 60-day window matches web default (was hardcoded 30)
+                lastDate: DateTime.now().add(const Duration(days: 60)),
+                // Gap 1: when allowAnyDay=true, all days selectable (weekday masses)
+                //         when false, only Sat/Sun (weekend masses)
+                selectableDayPredicate: _allowAnyDay
+                    ? null
+                    : (DateTime day) {
+                        return day.weekday == DateTime.saturday ||
+                            day.weekday == DateTime.sunday;
+                      },
+                onDateChanged: (d) {
+                  setState(() {
+                    dt = d;
+                    templateId = null;
+                    availableSlots = [];
+                    _publishedMasses = [];
+                  });
+                  _fetchSlots();
+                }),
           const SizedBox(height: 20),
           const Text("3. Select Time",
               style: TextStyle(fontWeight: FontWeight.bold)),
-          Wrap(
-              spacing: 8,
-              children: availableSlots
-                  .map((slot) => ChoiceChip(
-                      label: Text(slot['time']?.toString() ?? ''),
-                      selected: templateId != null && templateId == slot['id']?.toString(),
-                      onSelected: (sel) => setState(
-                          () => templateId = sel ? slot['id']?.toString() : null)))
-                  .toList()),
+          const SizedBox(height: 4),
+          // Gap 3 & 4: pass myBookings to enable availability checks
+          ..._buildGroupedTimeSlots(availableSlots, s.myBookings),
           const SizedBox(height: 40),
           SizedBox(
               width: double.infinity,
@@ -1930,32 +2370,167 @@ class AdminMainScreen extends StatefulWidget {
 
 class _AdminMainScreenState extends State<AdminMainScreen> {
   int _idx = 0;
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+
+  static const List<String> _titles = ["Live Operations", "Gate Scanner", "App Settings"];
+
+  Widget _buildDrawer(BuildContext context) {
+    return Drawer(
+      child: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.fromLTRB(20, 56, 20, 28),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(0xFF1E3A5F), Color(0xFF2D5F8A)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: const Icon(Icons.admin_panel_settings_rounded, color: Colors.white, size: 30),
+                ),
+                const SizedBox(height: 14),
+                const Text("Admin Tools",
+                    style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 4),
+                const Text("Parish management portal",
+                    style: TextStyle(color: Colors.white60, fontSize: 13)),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          _drawerItem(
+            context,
+            icon: Icons.category_rounded,
+            iconColor: const Color(0xFF1E3A5F),
+            iconBg: const Color(0xFFEAF0F8),
+            title: "Mass Masters",
+            subtitle: "Languages, Locations & Events",
+            onTap: () {
+              Navigator.pop(context);
+              Navigator.push(context, MaterialPageRoute(builder: (_) => const AdminMastersScreen()));
+            },
+          ),
+          _drawerItem(
+            context,
+            icon: Icons.calendar_month_rounded,
+            iconColor: Colors.amber.shade800,
+            iconBg: Colors.amber.shade50,
+            title: "Mass Schedule",
+            subtitle: "Manage recurring & one-time templates",
+            onTap: () {
+              Navigator.pop(context);
+              Navigator.push(context, MaterialPageRoute(builder: (_) => const AdminScheduleScreen()));
+            },
+          ),
+          _drawerItem(
+            context,
+            icon: Icons.person_add_rounded,
+            iconColor: Colors.green.shade700,
+            iconBg: Colors.green.shade50,
+            title: "Book for Member",
+            subtitle: "Create account & book a Mass",
+            onTap: () {
+              Navigator.pop(context);
+              Navigator.push(context, MaterialPageRoute(builder: (_) => const AdminBookForUserScreen()));
+            },
+          ),
+          const Spacer(),
+          const Divider(height: 1),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(children: [
+              const Icon(Icons.church_rounded, size: 16, color: Colors.grey),
+              const SizedBox(width: 8),
+              Text("St. Mary's Catholic Church, Dubai",
+                  style: TextStyle(color: Colors.grey.shade600, fontSize: 11)),
+            ]),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _drawerItem(BuildContext context, {
+    required IconData icon,
+    required Color iconColor,
+    required Color iconBg,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      leading: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(color: iconBg, borderRadius: BorderRadius.circular(12)),
+        child: Icon(icon, color: iconColor, size: 22),
+      ),
+      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+      subtitle: Text(subtitle, style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+      trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+      onTap: onTap,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      key: _scaffoldKey,
+      drawer: _idx == 0 ? _buildDrawer(context) : null,
       appBar: AppBar(
-          title: const Text("Admin Mission Control"),
-          backgroundColor: const Color(0xFF1E3A5F),
-          foregroundColor: Colors.white,
-          actions: [
-            IconButton(
-                onPressed: () => context.read<AppState>().logout(),
-                icon: const Icon(Icons.logout))
-          ]),
+        title: Text(_titles[_idx]),
+        backgroundColor: const Color(0xFF1E3A5F),
+        foregroundColor: Colors.white,
+        leading: _idx == 0
+            ? IconButton(
+                icon: const Icon(Icons.menu_rounded),
+                onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+              )
+            : null,
+        actions: [
+          IconButton(
+            onPressed: () => context.read<AppState>().logout(),
+            icon: const Icon(Icons.logout_rounded),
+          ),
+        ],
+      ),
       body: [
         const AdminDashboardTab(),
         const AdminScannerTab(),
         const AdminSettingsTab(),
       ][_idx],
       bottomNavigationBar: NavigationBar(
-          selectedIndex: _idx,
-          onDestinationSelected: (i) => setState(() => _idx = i),
-          destinations: const [
-            NavigationDestination(icon: Icon(Icons.dashboard), label: 'Dashboard'),
-            NavigationDestination(icon: Icon(Icons.qr_code_scanner), label: 'Gate Scan'),
-            NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
-          ]),
+        selectedIndex: _idx,
+        onDestinationSelected: (i) => setState(() => _idx = i),
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.dashboard_outlined),
+            selectedIcon: Icon(Icons.dashboard_rounded),
+            label: 'Dashboard',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.qr_code_scanner_outlined),
+            selectedIcon: Icon(Icons.qr_code_scanner),
+            label: 'Scanner',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings_rounded),
+            label: 'Settings',
+          ),
+        ],
+      ),
     );
   }
 }
@@ -2049,82 +2624,199 @@ class _AdminDashboardTabState extends State<AdminDashboardTab> {
       },
       child: SingleChildScrollView(
         physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.all(20),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Live Operations",
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 20),
-            if (_loadingSummary)
-              const Center(child: CircularProgressIndicator())
-            else
-              Row(children: [
-                Expanded(
-                    child: _statCard("Total Verified\nVisitors",
-                        summary['totalVisitors'].toString(), Colors.green)),
-                const SizedBox(width: 15),
-                Expanded(
-                    child: _statCard("Total Rejected\nAttempts",
-                        summary['totalRejected'].toString(), Colors.red)),
-              ]),
-            const SizedBox(height: 40),
-            
-            // STATS TABLE SECTION
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text("Mass Statistics",
-                    style:
-                        TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                TextButton.icon(
-                  onPressed: _pickDate,
-                  icon: const Icon(Icons.calendar_today, size: 16),
-                  label: Text(
-                      "${_selectedDate.year}-${_selectedDate.month.toString().padLeft(2, '0')}-${_selectedDate.day.toString().padLeft(2, '0')}"),
-                )
-              ],
+            // ── Gradient banner ──────────────────────────────────
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(20, 24, 20, 32),
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [Color(0xFF1E3A5F), Color(0xFF2D5F8A)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    Container(
+                      width: 8, height: 8,
+                      decoration: const BoxDecoration(
+                          color: Colors.greenAccent,
+                          shape: BoxShape.circle),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      "LIVE  •  ${DateFormat('EEEE, d MMM y').format(DateTime.now())}",
+                      style: const TextStyle(color: Colors.white70, fontSize: 11, letterSpacing: 1.2),
+                    ),
+                    const Spacer(),
+                    InkWell(
+                      onTap: () async { await _fetchSummary(); await _fetchDetailedStats(); },
+                      child: const Icon(Icons.refresh_rounded, color: Colors.white70, size: 20),
+                    ),
+                  ]),
+                  const SizedBox(height: 10),
+                  const Text("Parish Operations",
+                      style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  const Text("Real-time attendance & statistics",
+                      style: TextStyle(color: Colors.white60, fontSize: 13)),
+                ],
+              ),
             ),
-            const SizedBox(height: 10),
+
+            // ── KPI Cards ─────────────────────────────────────────
+            Transform.translate(
+              offset: const Offset(0, -20),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: _loadingSummary
+                    ? const Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(20),
+                          child: CircularProgressIndicator(color: Colors.white),
+                        ))
+                    : Row(children: [
+                        Expanded(child: _kpiCard(
+                          "Verified Today",
+                          summary['totalVisitors']?.toString() ?? '0',
+                          Icons.check_circle_rounded,
+                          const Color(0xFF2E7D32),
+                          Colors.green.shade50,
+                        )),
+                        const SizedBox(width: 12),
+                        Expanded(child: _kpiCard(
+                          "Rejected Today",
+                          summary['totalRejected']?.toString() ?? '0',
+                          Icons.cancel_rounded,
+                          const Color(0xFFC62828),
+                          Colors.red.shade50,
+                        )),
+                      ]),
+              ),
+            ),
+
+            // ── Statistics Section ────────────────────────────────
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+              child: Row(children: [
+                const Icon(Icons.bar_chart_rounded, color: Color(0xFF1E3A5F), size: 20),
+                const SizedBox(width: 8),
+                const Text("Mass Statistics",
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E3A5F))),
+                const Spacer(),
+                OutlinedButton.icon(
+                  onPressed: _pickDate,
+                  icon: const Icon(Icons.calendar_today_rounded, size: 13),
+                  label: Text(DateFormat('d MMM y').format(_selectedDate),
+                      style: const TextStyle(fontSize: 12)),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    side: const BorderSide(color: Color(0xFF1E3A5F)),
+                    foregroundColor: const Color(0xFF1E3A5F),
+                  ),
+                ),
+              ]),
+            ),
+
             if (_loadingStats)
               const Padding(
-                padding: EdgeInsets.all(20.0),
+                padding: EdgeInsets.all(32),
                 child: Center(child: CircularProgressIndicator()),
               )
             else if (_slotStats.isEmpty)
-              const Padding(
-                padding: EdgeInsets.all(20.0),
+              Padding(
+                padding: const EdgeInsets.all(32),
                 child: Center(
-                    child: Text("No mass slots found for this date.",
-                        style: TextStyle(color: Colors.grey))),
+                  child: Column(children: [
+                    Icon(Icons.event_busy_rounded, size: 48, color: Colors.grey.shade300),
+                    const SizedBox(height: 12),
+                    Text("No mass slots for this date",
+                        style: TextStyle(color: Colors.grey.shade500)),
+                  ]),
+                ),
               )
             else
-              SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: DataTable(
-                  headingRowColor:
-                      WidgetStateProperty.all(Colors.grey.shade100),
-                  columns: const [
-                    DataColumn(label: Text("Date")),
-                    DataColumn(label: Text("Mass")),
-                    DataColumn(label: Text("Booked")),
-                    DataColumn(label: Text("Accepted")),
-                    DataColumn(label: Text("Cancelled")),
-                    DataColumn(label: Text("Rejected")),
-                  ],
-                  rows: _slotStats.map((slot) {
-                    final counts = slot['counts'] ?? {};
-                    return DataRow(cells: [
-                      DataCell(Text(slot['date'].toString())),
-                      DataCell(Text(slot['label'].toString())),
-                      DataCell(Text(counts['booked']?.toString() ?? '0')),
-                      DataCell(Text(counts['attended']?.toString() ?? '0')),
-                      DataCell(Text(counts['cancelled']?.toString() ?? '0')),
-                      DataCell(Text(((counts['expired'] ?? 0) +
-                              (counts['no_show'] ?? 0))
-                          .toString())),
-                    ]);
-                  }).toList(),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade200),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: DataTable(
+                        headingRowColor: WidgetStateProperty.all(const Color(0xFFF0F4F8)),
+                        headingTextStyle: const TextStyle(
+                            fontWeight: FontWeight.bold, fontSize: 12, color: Color(0xFF1E3A5F)),
+                        dataTextStyle: const TextStyle(fontSize: 12),
+                        columnSpacing: 20,
+                        columns: const [
+                          DataColumn(label: Text("Date")),
+                          DataColumn(label: Text("Mass")),
+                          DataColumn(label: Text("Cap/Eff"), numeric: true),
+                          DataColumn(label: Text("Booked"), numeric: true),
+                          DataColumn(label: Text("Attended"), numeric: true),
+                          DataColumn(label: Text("Cancelled"), numeric: true),
+                          DataColumn(label: Text("Expired"), numeric: true),
+                          DataColumn(label: Text("No-show"), numeric: true),
+                          DataColumn(label: Text("Remaining"), numeric: true),
+                          DataColumn(label: Text("Util %"), numeric: true),
+                          DataColumn(label: Text("Att. Rate")),
+                        ],
+                        rows: _slotStats.map((slot) {
+                          final counts = slot['counts'] ?? {};
+                          final cap = slot['capacity'] ?? 0;
+                          final eff = slot['effectiveSeats'] ?? cap;
+                          final rem = slot['remainingSeats'] ?? 0;
+                          final util = slot['utilizationPercentOfEffective'];
+                          final att = slot['attendanceRate'];
+                          final utilStr = util != null ? '${util.toStringAsFixed(1)}%' : '—';
+                          final attStr = att != null ? '${(att * 100).toStringAsFixed(1)}%' : '—';
+                          final booked = counts['booked'] ?? 0;
+                          final isNearFull = rem <= 5 && rem > 0;
+                          final isFull = booked >= eff && eff > 0;
+                          return DataRow(
+                            color: WidgetStateProperty.resolveWith((states) {
+                              if (isFull) return Colors.red.shade50;
+                              if (isNearFull) return Colors.orange.shade50;
+                              return null;
+                            }),
+                            cells: [
+                              DataCell(Text(slot['date']?.toString() ?? '')),
+                              DataCell(Text(slot['label']?.toString() ?? '',
+                                  overflow: TextOverflow.ellipsis)),
+                              DataCell(Text('$cap/$eff')),
+                              DataCell(Text(booked.toString(),
+                                  style: booked > 0
+                                      ? const TextStyle(fontWeight: FontWeight.bold)
+                                      : null)),
+                              DataCell(Text((counts['attended'] ?? 0).toString())),
+                              DataCell(Text((counts['cancelled'] ?? 0).toString())),
+                              DataCell(Text((counts['expired'] ?? 0).toString())),
+                              DataCell(Text((counts['no_show'] ?? 0).toString())),
+                              DataCell(Text(rem.toString(),
+                                  style: TextStyle(
+                                    color: isFull ? Colors.red.shade700
+                                        : isNearFull ? Colors.orange.shade700
+                                        : Colors.green.shade700,
+                                    fontWeight: FontWeight.w600,
+                                  ))),
+                              DataCell(Text(utilStr)),
+                              DataCell(Text(attStr)),
+                            ],
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ),
                 ),
               ),
           ],
@@ -2133,22 +2825,38 @@ class _AdminDashboardTabState extends State<AdminDashboardTab> {
     );
   }
 
-  Widget _statCard(String label, String value, Color color) {
+  Widget _kpiCard(String label, String value, IconData icon, Color accent, Color bg) {
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-          color: color.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(15),
-          border: Border.all(color: color.withOpacity(0.5))),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: accent.withOpacity(0.15),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+        border: Border.all(color: accent.withOpacity(0.2)),
+      ),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(value,
-              style: TextStyle(
-                  fontSize: 36, fontWeight: FontWeight.bold, color: color)),
+          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(10)),
+              child: Icon(icon, color: accent, size: 20),
+            ),
+            Text(value,
+                style: TextStyle(
+                    fontSize: 32, fontWeight: FontWeight.bold, color: accent)),
+          ]),
           const SizedBox(height: 10),
           Text(label,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontWeight: FontWeight.w600)),
+              style: TextStyle(
+                  color: Colors.grey.shade700, fontSize: 12, fontWeight: FontWeight.w600)),
         ],
       ),
     );
@@ -2455,6 +3163,1074 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
       inactiveTrackColor: Colors.grey.shade200,
     );
   }
+}
+
+// ─── ADMIN MASTERS SCREEN ───────────────────────────────────
+class AdminMastersScreen extends StatefulWidget {
+  const AdminMastersScreen({super.key});
+  @override
+  State<AdminMastersScreen> createState() => _AdminMastersScreenState();
+}
+
+class _AdminMastersScreenState extends State<AdminMastersScreen>
+    with SingleTickerProviderStateMixin {
+  late TabController _tc;
+  final List<String> _types = ['language', 'location', 'event'];
+  final List<List<dynamic>> _data = [[], [], []];
+  final List<bool> _loading = [true, true, true];
+
+  @override
+  void initState() {
+    super.initState();
+    _tc = TabController(length: 3, vsync: this);
+    _fetchAll();
+  }
+
+  @override
+  void dispose() {
+    _tc.dispose();
+    super.dispose();
+  }
+
+  Future<void> _fetch(int idx) async {
+    if (mounted) setState(() => _loading[idx] = true);
+    try {
+      final res = await http.get(
+        Uri.parse('${ConvexConfig.baseUrl}/admin/masters?type=${_types[idx]}'),
+        headers: ConvexConfig.headers,
+      );
+      if (res.statusCode == 200 && mounted) {
+        final body = jsonDecode(res.body);
+        if (body['ok'] == true) {
+          setState(() {
+            _data[idx] = List<dynamic>.from(body['data'] ?? []);
+            _loading[idx] = false;
+          });
+        }
+      }
+    } catch (_) {
+      if (mounted) setState(() => _loading[idx] = false);
+    }
+  }
+
+  void _fetchAll() { for (int i = 0; i < 3; i++) _fetch(i); }
+
+  Future<void> _upsert(int idx, {String? id, required String name, required bool active, required int order}) async {
+    await http.post(
+      Uri.parse('${ConvexConfig.baseUrl}/admin/masters'),
+      headers: ConvexConfig.headers,
+      body: jsonEncode({'type': _types[idx], if (id != null) 'id': id, 'name': name, 'active': active, 'displayOrder': order}),
+    );
+    _fetch(idx);
+  }
+
+  Future<void> _remove(int idx, String id) async {
+    await http.delete(
+      Uri.parse('${ConvexConfig.baseUrl}/admin/masters'),
+      headers: ConvexConfig.headers,
+      body: jsonEncode({'type': _types[idx], 'id': id}),
+    );
+    _fetch(idx);
+  }
+
+  void _showDialog(int idx, {Map<String, dynamic>? item}) {
+    final nameCtrl = TextEditingController(text: item?['name'] ?? '');
+    final orderCtrl = TextEditingController(text: (item?['displayOrder'] ?? _data[idx].length).toString());
+    bool active = item?['active'] != false;
+    final titles = ['Language', 'Location', 'Event'];
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: Text(item == null ? 'Add ${titles[idx]}' : 'Edit ${titles[idx]}'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Name', border: OutlineInputBorder())),
+          const SizedBox(height: 12),
+          TextField(controller: orderCtrl, decoration: const InputDecoration(labelText: 'Display Order', border: OutlineInputBorder()), keyboardType: TextInputType.number),
+          const SizedBox(height: 4),
+          SwitchListTile(title: const Text('Active'), value: active, onChanged: (v) => ss(() => active = v), contentPadding: EdgeInsets.zero),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white),
+            onPressed: () {
+              if (nameCtrl.text.trim().isEmpty) return;
+              Navigator.pop(ctx);
+              _upsert(idx, id: item?['_id'] as String?, name: nameCtrl.text.trim(), active: active, order: int.tryParse(orderCtrl.text) ?? 0);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      )),
+    );
+  }
+
+  void _confirmDelete(int idx, Map<String, dynamic> item) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete?'),
+        content: Text('Remove "${item['name']}"? This cannot be undone.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
+            onPressed: () { Navigator.pop(ctx); _remove(idx, item['_id'] as String); },
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTab(int idx) {
+    if (_loading[idx]) return const Center(child: CircularProgressIndicator());
+    final items = _data[idx];
+    if (items.isEmpty) return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+      Icon(Icons.inbox_rounded, size: 56, color: Colors.grey.shade300),
+      const SizedBox(height: 12),
+      Text('No items yet. Tap + to add.', style: TextStyle(color: Colors.grey.shade500)),
+    ]));
+    return RefreshIndicator(
+      onRefresh: () => _fetch(idx),
+      child: ListView.separated(
+        padding: const EdgeInsets.all(16),
+        itemCount: items.length,
+        separatorBuilder: (_, __) => const SizedBox(height: 8),
+        itemBuilder: (_, i) {
+          final item = items[i] as Map<String, dynamic>;
+          final active = item['active'] != false;
+          return Container(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 8, offset: const Offset(0, 2))],
+              border: Border.all(color: Colors.grey.shade200),
+            ),
+            child: ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              leading: Container(
+                width: 36, height: 36,
+                decoration: BoxDecoration(
+                  color: active ? const Color(0xFF1E3A5F).withOpacity(0.1) : Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Center(child: Text('${item['displayOrder'] ?? 0}',
+                    style: TextStyle(fontWeight: FontWeight.bold,
+                        color: active ? const Color(0xFF1E3A5F) : Colors.grey))),
+              ),
+              title: Text(item['name']?.toString() ?? '', style: const TextStyle(fontWeight: FontWeight.w600)),
+              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: active ? Colors.green.shade50 : Colors.grey.shade100,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: active ? Colors.green.shade200 : Colors.grey.shade300),
+                  ),
+                  child: Text(active ? 'Active' : 'Inactive',
+                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600,
+                          color: active ? Colors.green.shade700 : Colors.grey.shade600)),
+                ),
+                const SizedBox(width: 4),
+                IconButton(icon: const Icon(Icons.edit_rounded, size: 18), color: const Color(0xFF1E3A5F),
+                    onPressed: () => _showDialog(idx, item: item)),
+                IconButton(icon: const Icon(Icons.delete_rounded, size: 18), color: Colors.red,
+                    onPressed: () => _confirmDelete(idx, item)),
+              ]),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF5F7FA),
+      appBar: AppBar(
+        title: const Text('Mass Masters'),
+        backgroundColor: const Color(0xFF1E3A5F),
+        foregroundColor: Colors.white,
+        bottom: TabBar(
+          controller: _tc,
+          labelColor: Colors.white,
+          unselectedLabelColor: Colors.white60,
+          indicatorColor: Colors.amber,
+          tabs: const [Tab(text: 'Languages'), Tab(text: 'Locations'), Tab(text: 'Events')],
+        ),
+      ),
+      body: TabBarView(controller: _tc, children: [_buildTab(0), _buildTab(1), _buildTab(2)]),
+      floatingActionButton: FloatingActionButton.extended(
+        backgroundColor: const Color(0xFF1E3A5F),
+        foregroundColor: Colors.white,
+        icon: const Icon(Icons.add_rounded),
+        label: const Text('Add'),
+        onPressed: () => _showDialog(_tc.index),
+      ),
+    );
+  }
+}
+
+
+// ─── ADMIN SCHEDULE SCREEN ──────────────────────────────────
+class AdminScheduleScreen extends StatefulWidget {
+  const AdminScheduleScreen({super.key});
+  @override
+  State<AdminScheduleScreen> createState() => _AdminScheduleScreenState();
+}
+
+class _AdminScheduleScreenState extends State<AdminScheduleScreen> {
+  List<dynamic> _templates = [];
+  bool _loading = true;
+  List<String> _languages = [], _locations = [], _events = [];
+
+  final _days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  final _categories = ['Weekend','Weekday'];
+  final _repeats = ['None','Weekly','Monthly'];
+
+  @override
+  void initState() { super.initState(); _loadAll(); }
+
+  Future<void> _loadAll() async {
+    setState(() => _loading = true);
+    await Future.wait([_fetchTemplates(), _fetchMasters()]);
+    if (mounted) setState(() => _loading = false);
+  }
+
+  Future<void> _fetchTemplates() async {
+    try {
+      final r = await http.get(Uri.parse('${ConvexConfig.baseUrl}/admin/mass-templates'), headers: ConvexConfig.headers);
+      if (r.statusCode == 200 && mounted) {
+        final b = jsonDecode(r.body);
+        if (b['ok'] == true) setState(() => _templates = List<dynamic>.from(b['data'] ?? []));
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _fetchMasters() async {
+    for (final type in ['language','location','event']) {
+      try {
+        final r = await http.get(Uri.parse('${ConvexConfig.baseUrl}/admin/masters?type=$type'), headers: ConvexConfig.headers);
+        if (r.statusCode == 200) {
+          final b = jsonDecode(r.body);
+          if (b['ok'] == true) {
+            final names = (List<dynamic>.from(b['data'] ?? [])).map((e) => e['name']?.toString() ?? '').where((s) => s.isNotEmpty).toList();
+            if (mounted) setState(() { if (type == 'language') _languages = names; else if (type == 'location') _locations = names; else _events = names; });
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _upsert(Map<String, dynamic> data) async {
+    await http.post(Uri.parse('${ConvexConfig.baseUrl}/admin/mass-templates'), headers: ConvexConfig.headers, body: jsonEncode(data));
+    _fetchTemplates();
+  }
+
+  Future<void> _delete(String id) async {
+    await http.delete(Uri.parse('${ConvexConfig.baseUrl}/admin/mass-templates'), headers: ConvexConfig.headers, body: jsonEncode({'id': id}));
+    _fetchTemplates();
+  }
+
+  void _openSheet({Map<String, dynamic>? item}) {
+    String type = item?['type'] ?? 'recurring';
+    String day = item?['day'] ?? 'Sunday';
+    String date = item?['date'] ?? '';
+    String time = item?['time'] ?? '08:00 AM';
+    String lang = item?['language'] ?? (_languages.isNotEmpty ? _languages.first : '');
+    String loc = item?['location'] ?? (_locations.isNotEmpty ? _locations.first : '');
+    String obligatory = item?['obligatory'] ?? 'Non-Obligatory';
+    String category = item?['category'] ?? 'Weekend';
+    String repeat = item?['repeat'] ?? 'Weekly';
+    String? event = item?['event'];
+    bool active = item?['active'] != false;
+    final timeCtrl = TextEditingController(text: time);
+    final dateCtrl = TextEditingController(text: date);
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, ss) => Container(
+          height: MediaQuery.of(context).size.height * 0.88,
+          decoration: const BoxDecoration(color: Colors.white, borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+          child: Column(children: [
+            Container(height: 4, width: 48, margin: const EdgeInsets.symmetric(vertical: 12), decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(2))),
+            Padding(padding: const EdgeInsets.symmetric(horizontal: 20), child: Row(children: [
+              Text(item == null ? 'Add Schedule' : 'Edit Schedule', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const Spacer(),
+              IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(ctx)),
+            ])),
+            const Divider(),
+            Expanded(child: SingleChildScrollView(padding: const EdgeInsets.all(20), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              // Type toggle
+              Row(children: ['recurring','one-time'].map((t) => Expanded(child: Padding(
+                padding: EdgeInsets.only(right: t == 'recurring' ? 6 : 0, left: t == 'one-time' ? 6 : 0),
+                child: ChoiceChip(label: Text(t == 'recurring' ? '🔁 Recurring' : '📅 One-Time'), selected: type == t,
+                  onSelected: (_) => ss(() => type = t),
+                  selectedColor: const Color(0xFF1E3A5F), labelStyle: TextStyle(color: type == t ? Colors.white : Colors.black87)),
+              ))).toList()),
+              const SizedBox(height: 16),
+              if (type == 'recurring')
+                DropdownButtonFormField<String>(value: _days.contains(day) ? day : _days.first, decoration: const InputDecoration(labelText: 'Day of Week', border: OutlineInputBorder()), items: _days.map((d) => DropdownMenuItem(value: d, child: Text(d))).toList(), onChanged: (v) => ss(() => day = v!))
+              else
+                TextField(controller: dateCtrl, decoration: const InputDecoration(labelText: 'Date (YYYY-MM-DD)', border: OutlineInputBorder()), onChanged: (v) => date = v),
+              const SizedBox(height: 12),
+              TextField(controller: timeCtrl, decoration: const InputDecoration(labelText: 'Time (e.g. 08:00 AM)', border: OutlineInputBorder()), onChanged: (v) => time = v),
+              const SizedBox(height: 12),
+              if (_languages.isNotEmpty)
+                DropdownButtonFormField<String>(value: _languages.contains(lang) ? lang : _languages.first, decoration: const InputDecoration(labelText: 'Language', border: OutlineInputBorder()), items: _languages.map((l) => DropdownMenuItem(value: l, child: Text(l))).toList(), onChanged: (v) => ss(() => lang = v!))
+              else
+                TextField(decoration: const InputDecoration(labelText: 'Language', border: OutlineInputBorder()), onChanged: (v) => lang = v),
+              const SizedBox(height: 12),
+              if (_locations.isNotEmpty)
+                DropdownButtonFormField<String>(value: _locations.contains(loc) ? loc : _locations.first, decoration: const InputDecoration(labelText: 'Location', border: OutlineInputBorder()), items: _locations.map((l) => DropdownMenuItem(value: l, child: Text(l))).toList(), onChanged: (v) => ss(() => loc = v!))
+              else
+                TextField(decoration: const InputDecoration(labelText: 'Location', border: OutlineInputBorder()), onChanged: (v) => loc = v),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(value: category, decoration: const InputDecoration(labelText: 'Category', border: OutlineInputBorder()), items: _categories.map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(), onChanged: (v) => ss(() => category = v!)),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(value: obligatory, decoration: const InputDecoration(labelText: 'Obligatory', border: OutlineInputBorder()), items: ['Obligatory','Non-Obligatory'].map((o) => DropdownMenuItem(value: o, child: Text(o))).toList(), onChanged: (v) => ss(() => obligatory = v!)),
+              const SizedBox(height: 12),
+              if (type == 'recurring')
+                DropdownButtonFormField<String>(value: repeat, decoration: const InputDecoration(labelText: 'Repeat', border: OutlineInputBorder()), items: _repeats.map((r) => DropdownMenuItem(value: r, child: Text(r))).toList(), onChanged: (v) => ss(() => repeat = v!)),
+              if (type == 'recurring') const SizedBox(height: 12),
+              if (_events.isNotEmpty)
+                DropdownButtonFormField<String?>(value: event, decoration: const InputDecoration(labelText: 'Special Event (optional)', border: OutlineInputBorder()),
+                  items: [const DropdownMenuItem(value: null, child: Text('None')), ..._events.map((e) => DropdownMenuItem(value: e, child: Text(e)))],
+                  onChanged: (v) => ss(() => event = v)),
+              const SizedBox(height: 12),
+              SwitchListTile(title: const Text('Active'), value: active, onChanged: (v) => ss(() => active = v), contentPadding: EdgeInsets.zero),
+            ]))),
+            Padding(padding: const EdgeInsets.fromLTRB(20, 0, 20, 24), child: SizedBox(width: double.infinity, child: ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 16)),
+              onPressed: () {
+                Navigator.pop(ctx);
+                final payload = <String, dynamic>{
+                  if (item != null) 'id': item['_id'],
+                  'type': type, 'language': lang, 'location': loc,
+                  'time': timeCtrl.text.trim(), 'obligatory': obligatory,
+                  'category': category, 'active': active,
+                  if (type == 'recurring') ...{'day': day, 'repeat': repeat},
+                  if (type == 'one-time') ...{'date': dateCtrl.text.trim(), 'repeat': 'None'},
+                  if (event != null) 'event': event,
+                };
+                _upsert(payload);
+              },
+              child: Text(item == null ? 'Create Schedule' : 'Update Schedule'),
+            ))),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCard(Map<String, dynamic> t) {
+    final isRecurring = t['type'] == 'recurring';
+    final active = t['active'] != false;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(14),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 8, offset: const Offset(0, 2))],
+        border: Border.all(color: active ? Colors.grey.shade200 : Colors.grey.shade300)),
+      child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        leading: Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: isRecurring ? const Color(0xFFF9A825).withOpacity(0.15) : Colors.purple.shade50, borderRadius: BorderRadius.circular(12)),
+          child: Icon(isRecurring ? Icons.repeat_rounded : Icons.event_rounded, color: isRecurring ? Colors.amber.shade800 : Colors.purple.shade700, size: 20)),
+        title: Text('${t['time'] ?? ''} — ${t['language'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+        subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const SizedBox(height: 4),
+          Text('${isRecurring ? (t['day'] ?? '') : (t['date'] ?? '')} • ${t['location'] ?? ''}', style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+          const SizedBox(height: 4),
+          Wrap(spacing: 6, children: [
+            _chip(t['category'] ?? '', Colors.blue.shade700, Colors.blue.shade50),
+            if (t['obligatory'] == 'Obligatory') _chip('Obligatory', Colors.amber.shade800, Colors.amber.shade50),
+            if (!active) _chip('Inactive', Colors.grey, Colors.grey.shade100),
+          ]),
+        ]),
+        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+          IconButton(icon: const Icon(Icons.edit_rounded, size: 18), color: const Color(0xFF1E3A5F), onPressed: () => _openSheet(item: t)),
+          IconButton(icon: const Icon(Icons.delete_rounded, size: 18), color: Colors.red, onPressed: () => showDialog(context: context, builder: (ctx) => AlertDialog(
+            title: const Text('Delete Schedule?'),
+            content: Text('Remove ${t['time']} ${t['language']} on ${isRecurring ? t['day'] : t['date']}?'),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')), ElevatedButton(style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white), onPressed: () { Navigator.pop(ctx); _delete(t['_id'] as String); }, child: const Text('Delete'))],
+          ))),
+        ]),
+      ),
+    );
+  }
+
+  Widget _chip(String label, Color color, Color bg) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+    decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(12)),
+    child: Text(label, style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: color)),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    final recurring = _templates.where((t) => t['type'] == 'recurring').toList();
+    final oneTime = _templates.where((t) => t['type'] == 'one-time').toList();
+    return Scaffold(
+      backgroundColor: const Color(0xFFF5F7FA),
+      appBar: AppBar(title: const Text('Mass Schedule'), backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : RefreshIndicator(
+              onRefresh: _loadAll,
+              child: ListView(padding: const EdgeInsets.all(16), children: [
+                if (recurring.isNotEmpty) ...[
+                  _sectionHeader('🔁 Recurring Masses', recurring.length),
+                  ...recurring.map((t) => _buildCard(t as Map<String, dynamic>)),
+                  const SizedBox(height: 8),
+                ],
+                if (oneTime.isNotEmpty) ...[
+                  _sectionHeader('📅 One-Time Masses', oneTime.length),
+                  ...oneTime.map((t) => _buildCard(t as Map<String, dynamic>)),
+                ],
+                if (_templates.isEmpty) Center(child: Padding(padding: const EdgeInsets.all(48), child: Column(children: [
+                  Icon(Icons.calendar_month_rounded, size: 64, color: Colors.grey.shade300),
+                  const SizedBox(height: 16),
+                  Text('No schedules yet.\nTap + to add one.', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey.shade500)),
+                ]))),
+              ]),
+            ),
+      floatingActionButton: FloatingActionButton.extended(
+        backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white,
+        icon: const Icon(Icons.add_rounded), label: const Text('Add Schedule'),
+        onPressed: _openSheet,
+      ),
+    );
+  }
+
+  Widget _sectionHeader(String title, int count) => Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: Row(children: [
+      Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+      const SizedBox(width: 8),
+      Container(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        decoration: BoxDecoration(color: const Color(0xFF1E3A5F).withOpacity(0.1), borderRadius: BorderRadius.circular(10)),
+        child: Text('$count', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Color(0xFF1E3A5F)))),
+    ]),
+  );
+}
+
+// ─── ADMIN BOOK FOR USER SCREEN ─────────────────────────────
+class AdminBookForUserScreen extends StatefulWidget {
+  const AdminBookForUserScreen({super.key});
+  @override
+  State<AdminBookForUserScreen> createState() => _AdminBookForUserScreenState();
+}
+
+class _AdminBookForUserScreenState extends State<AdminBookForUserScreen> {
+  // Steps: 0=create-user 1=after-create 2=add-family 3=book-mass 4=success
+  int _step = 0;
+  String? _ownerUserId;
+  String _memberName = '', _memberEmail = '', _memberMobile = '';
+  bool _isExisting = false;
+  List<dynamic> _profiles = [];
+  List<dynamic> _slots = [];
+  String? _selectedTemplateId;
+  DateTime _selectedDate = DateTime.now();
+  Set<String> _selectedProfileIds = {};
+  bool _allowAnyDay = false;
+  List<dynamic> _bookingResults = [];
+  bool _loadingSlots = false, _submitting = false;
+  String? _bookError;
+
+  // Form controllers
+  final _f = GlobalKey<FormState>();
+  DateTime? _selectedDob;
+
+  // ── Emirates ID scan state ───────────────────────────────────
+  bool _scanning = false;
+  String? _scanError;
+  File? _scannedImage;
+  double? _scanConfidence;
+
+  Future<void> _scanEmiratesId(ImageSource source) async {
+    setState(() { _scanning = true; _scanError = null; _scannedImage = null; _scanConfidence = null; });
+    try {
+      final picker = ImagePicker();
+      final picked = await picker.pickImage(
+        source: source,
+        imageQuality: 90,
+        preferredCameraDevice: CameraDevice.rear,
+      );
+      if (picked == null) { setState(() => _scanning = false); return; }
+
+      final imageFile = File(picked.path);
+      setState(() => _scannedImage = imageFile);
+
+      final uri = Uri.parse('${ConvexConfig.baseUrl}/extract-id');
+      final request = http.MultipartRequest('POST', uri)
+        ..headers.addAll({
+          'X-Mobile-Auth': 'UIYhkjasd09812ajsdasd143',
+        })
+        ..files.add(await http.MultipartFile.fromPath('image', imageFile.path));
+
+      final streamed = await request.send();
+      final body = await streamed.stream.bytesToString();
+      final json = jsonDecode(body) as Map<String, dynamic>;
+
+      if (streamed.statusCode != 200 || json['ok'] != true) {
+        setState(() {
+          _scanError = json['error']?.toString() ?? 'Could not extract ID details.';
+          _scanning = false;
+        });
+        return;
+      }
+
+      final extractedName   = json['name']?.toString() ?? '';
+      final extractedDob    = json['dob']?.toString() ?? '';   // YYYY-MM-DD
+      final extractedEid    = json['emiratesId']?.toString() ?? ''; // 784-YYYY-XXXXXXX-X
+      final confidence      = (json['confidence'] as num?)?.toDouble();
+
+      if (extractedName.isNotEmpty) _nameCtrl.text = extractedName;
+
+      if (extractedDob.isNotEmpty) {
+        try { _selectedDob = DateTime.parse(extractedDob); } catch (_) {}
+      }
+
+      if (extractedEid.isNotEmpty) {
+        final parts = extractedEid.split('-');
+        if (parts.length == 4) {
+          _eidCtrl.text = '${parts[2]}-${parts[3]}';
+        }
+      }
+
+      setState(() {
+        _scanning = false;
+        _scanConfidence = confidence;
+      });
+    } catch (e) {
+      setState(() {
+        _scanError = 'Scan failed: ${e.toString()}';
+        _scanning = false;
+      });
+    }
+  }
+
+  final _nameCtrl = TextEditingController();
+  final _emailCtrl = TextEditingController();
+  final _mobileCtrl = TextEditingController();
+  final _eidCtrl = TextEditingController();
+  final _parishCtrl = TextEditingController();
+  final _searchCtrl = TextEditingController();
+  bool _creatingUser = false;
+  String? _createError;
+  bool _searching = false;
+  String? _searchError;
+
+  @override
+  void dispose() {
+    for (final c in [_nameCtrl,_emailCtrl,_mobileCtrl,_eidCtrl,_parishCtrl,_searchCtrl]) c.dispose();
+    super.dispose();
+  }
+
+  void _reset() => setState(() {
+    _step = 0; _ownerUserId = null; _memberName = ''; _memberEmail = ''; _memberMobile = '';
+    _isExisting = false; _profiles = []; _slots = []; _selectedTemplateId = null;
+    _selectedDate = DateTime.now(); _selectedProfileIds = {};
+    _bookingResults = []; _bookError = null; _createError = null; _searchError = null;
+    _selectedDob = null;
+    _scanning = false; _scanError = null; _scannedImage = null; _scanConfidence = null;
+    for (final c in [_nameCtrl,_emailCtrl,_mobileCtrl,_eidCtrl,_parishCtrl,_searchCtrl]) c.clear();
+  });
+
+  Future<void> _createUser() async {
+    if (_f.currentState == null || !_f.currentState!.validate()) return;
+    if (_selectedDob == null) {
+      setState(() => _createError = 'Please select a Date of Birth.');
+      return;
+    }
+
+    setState(() { _creatingUser = true; _createError = null; });
+    try {
+      final dobStr = DateFormat('yyyy-MM-dd').format(_selectedDob!);
+      final fullEid = '784-${_selectedDob!.year}-${_eidCtrl.text}';
+
+      final r = await http.post(Uri.parse('${ConvexConfig.baseUrl}/admin/create-user'),
+        headers: ConvexConfig.headers,
+        body: jsonEncode({'fullName': _nameCtrl.text.trim(), 'email': _emailCtrl.text.trim(),
+          'mobile': _mobileCtrl.text.trim(), 'dob': dobStr,
+          'idNumber': fullEid, 'parishNumber': _parishCtrl.text.trim()}));
+      final b = jsonDecode(r.body);
+      if (b['ok'] == true && mounted) {
+        await _loadProfiles(b['ownerUserId'] as String);
+        setState(() { _ownerUserId = b['ownerUserId']; _memberName = _nameCtrl.text.trim();
+          _memberEmail = _emailCtrl.text.trim(); _memberMobile = _mobileCtrl.text.trim();
+          _isExisting = b['existing'] == true; _step = 1; });
+      } else {
+        setState(() => _createError = b['error']?.toString() ?? 'Failed to create member.');
+      }
+    } catch (e) { setState(() => _createError = 'Error: $e'); }
+    finally { if (mounted) setState(() => _creatingUser = false); }
+  }
+
+  Future<void> _searchMember() async {
+    final q = _searchCtrl.text.trim();
+    if (q.isEmpty) { setState(() => _searchError = 'Enter mobile or email.'); return; }
+    setState(() { _searching = true; _searchError = null; });
+    try {
+      final r = await http.get(Uri.parse('${ConvexConfig.baseUrl}/admin/find-member?q=${Uri.encodeComponent(q)}'), headers: ConvexConfig.headers);
+      final b = jsonDecode(r.body);
+      if (b['ok'] == true && b['data'] != null && mounted) {
+        final d = b['data'] as Map<String, dynamic>;
+        await _loadProfiles(d['ownerUserId'] as String);
+        final primary = (_profiles.firstWhere((p) => p['isPrimary'] == true, orElse: () => _profiles.isNotEmpty ? _profiles.first : {}));
+        setState(() { _ownerUserId = d['ownerUserId']; _memberName = primary['fullName']?.toString() ?? q;
+          _memberEmail = primary['email']?.toString() ?? ''; _memberMobile = primary['mobile']?.toString() ?? '';
+          _isExisting = true; _step = 1; });
+      } else { setState(() => _searchError = 'No member found for "$q".'); }
+    } catch (e) { setState(() => _searchError = 'Search error: $e'); }
+    finally { if (mounted) setState(() => _searching = false); }
+  }
+
+  Future<void> _loadProfiles(String uid) async {
+    final r = await http.get(Uri.parse('${ConvexConfig.baseUrl}/admin/family?ownerUserId=$uid'), headers: ConvexConfig.headers);
+    final b = jsonDecode(r.body);
+    if (b['ok'] == true && mounted) {
+      final ps = List<dynamic>.from(b['data'] ?? []);
+      setState(() {
+        _profiles = ps;
+        final primary = ps.firstWhere((p) => p['isPrimary'] == true, orElse: () => {});
+        if (primary['_id'] != null) _selectedProfileIds = {primary['_id'] as String};
+      });
+    }
+  }
+
+  Future<void> _fetchSlots() async {
+    setState(() { _loadingSlots = true; _selectedTemplateId = null; });
+    final ymd = DateFormat('yyyy-MM-dd').format(_selectedDate);
+    try {
+      final r = await http.get(Uri.parse('${ConvexConfig.baseUrl}/mass-schedule/times?parishDateYmd=$ymd'), headers: ConvexConfig.headers);
+      final b = jsonDecode(r.body);
+      if (b['ok'] == true && mounted) {
+        final slots = List<dynamic>.from(b['templateTimesForDay'] ?? []);
+        slots.sort((a, b) {
+          int tm(String s) { try { final p = s.trim().split(RegExp(r'\s+')); final hm = p[0].split(':'); int h = int.parse(hm[0]), m = hm.length > 1 ? int.parse(hm[1]) : 0; final ap = p.length > 1 ? p[1].toUpperCase() : ''; if (ap == 'PM' && h != 12) h += 12; if (ap == 'AM' && h == 12) h = 0; return h * 60 + m; } catch (_) { return 0; } }
+          return tm(a['time']?.toString() ?? '').compareTo(tm(b['time']?.toString() ?? ''));
+        });
+        setState(() { _slots = slots; _allowAnyDay = b['allowAnyDayWeekendScheduleBooking'] == true; });
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _loadingSlots = false);
+  }
+
+  Future<void> _confirmBooking() async {
+    if (_ownerUserId == null || _selectedTemplateId == null || _selectedProfileIds.isEmpty) return;
+    setState(() { _submitting = true; _bookError = null; });
+    try {
+      final r = await http.post(Uri.parse('${ConvexConfig.baseUrl}/admin/book-for-user'),
+        headers: ConvexConfig.headers,
+        body: jsonEncode({'ownerUserId': _ownerUserId, 'parishDateYmd': DateFormat('yyyy-MM-dd').format(_selectedDate),
+          'templateScheduleEntryId': _selectedTemplateId, 'profileIds': _selectedProfileIds.toList()}));
+      final b = jsonDecode(r.body);
+      if (b['ok'] == true && mounted) {
+        setState(() { _bookingResults = List<dynamic>.from(b['result']?['bookings'] ?? []); _step = 4; });
+      } else { setState(() => _bookError = b['error']?.toString() ?? 'Booking failed.'); }
+    } catch (e) { setState(() => _bookError = 'Error: $e'); }
+    finally { if (mounted) setState(() => _submitting = false); }
+  }
+
+  Widget _stepIndicator() {
+    final stepIdx = _step == 4 ? 3 : _step == 3 ? 2 : _step >= 1 ? 1 : 0;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      child: Row(children: List.generate(4, (i) {
+        final active = i <= stepIdx || _step == 4;
+        return Expanded(child: Container(
+          height: 3,
+          margin: const EdgeInsets.symmetric(horizontal: 2),
+          decoration: BoxDecoration(
+            color: active ? const Color(0xFF1E3A5F) : Colors.grey.shade200,
+            borderRadius: BorderRadius.circular(2),
+          ),
+        ));
+      })),
+    );
+  }
+
+  Widget _memberBanner() => Container(
+    margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(color: Colors.green.shade50, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.green.shade200)),
+    child: Row(children: [
+      Container(width: 40, height: 40, decoration: BoxDecoration(color: const Color(0xFF1E3A5F), shape: BoxShape.circle),
+        child: Center(child: Text(_memberName.isNotEmpty ? _memberName[0].toUpperCase() : '?', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
+      const SizedBox(width: 12),
+      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(_memberName, style: const TextStyle(fontWeight: FontWeight.bold)),
+        if (_memberEmail.isNotEmpty || _memberMobile.isNotEmpty)
+          Text([if (_memberEmail.isNotEmpty) _memberEmail, if (_memberMobile.isNotEmpty) _memberMobile].join(' • '), style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+        Text(_isExisting ? 'Existing member' : 'Newly created', style: TextStyle(fontSize: 11, color: Colors.green.shade700, fontWeight: FontWeight.w600)),
+      ])),
+      TextButton(onPressed: () => setState(() => _step = 0), child: const Text('Change')),
+    ]),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF5F7FA),
+      appBar: AppBar(
+        title: const Text('Book for Member'),
+        backgroundColor: const Color(0xFF1E3A5F),
+        foregroundColor: Colors.white,
+        actions: [if (_step > 0) TextButton(onPressed: _reset, child: const Text('Restart', style: TextStyle(color: Colors.white70)))],
+      ),
+      body: Column(
+        children: [
+          _stepIndicator(),
+          Expanded(child: _buildBody()),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBody() {
+    switch (_step) {
+      case 0: return _buildStep0();
+      case 1: return _buildStep1();
+      case 2: return _buildStep2();
+      case 3: return _buildStep3();
+      case 4: return _buildStep4();
+      default: return const SizedBox();
+    }
+  }
+
+  // ── Step 0: Create or find member ──────────────────────────
+  Widget _buildStep0() {
+    Widget fieldLabel(String text) => Padding(
+      padding: const EdgeInsets.only(bottom: 8, top: 12),
+      child: Text(text, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF1E3A5F))),
+    );
+
+    InputDecoration inputStyle({String? hint, Color? fill}) => InputDecoration(
+      hintText: hint, filled: true, fillColor: fill ?? Colors.grey.shade50,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+      enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.grey.shade300)),
+      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: const Color(0xFF1E3A5F), width: 1.5)),
+      errorBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.red.shade300)),
+      disabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+    );
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Form(
+        key: _f,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          _sectionCard('Member Information', Icons.person_add_rounded, children: [
+            if (_createError != null) _errorBox(_createError!),
+            
+            // ── Scanning UI ──────────────────────────────────────────────
+            Container(
+              decoration: BoxDecoration(color: const Color(0xFFEEF2FF), borderRadius: BorderRadius.circular(14), border: Border.all(color: const Color(0xFFBFCBF5))),
+              padding: const EdgeInsets.all(14),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                const Row(children: [
+                  Icon(Icons.credit_card, color: Color(0xFF1E3A5F), size: 18), SizedBox(width: 8),
+                  Text('Scan Emirates ID (optional)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF1E3A5F))),
+                ]),
+                const SizedBox(height: 4),
+                const Text('Take a photo or upload the front of the Emirates ID to auto-fill details.', style: TextStyle(fontSize: 12, color: Colors.black54)),
+                const SizedBox(height: 10),
+                if (!_scanning) Row(children: [
+                  Expanded(child: OutlinedButton.icon(
+                    icon: const Icon(Icons.camera_alt, size: 16), label: const Text('Camera', style: TextStyle(fontSize: 13)),
+                    style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFF1E3A5F), side: const BorderSide(color: Color(0xFF1E3A5F)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)), padding: const EdgeInsets.symmetric(vertical: 10)),
+                    onPressed: () => _scanEmiratesId(ImageSource.camera),
+                  )),
+                  const SizedBox(width: 10),
+                  Expanded(child: OutlinedButton.icon(
+                    icon: const Icon(Icons.photo_library, size: 16), label: const Text('Gallery', style: TextStyle(fontSize: 13)),
+                    style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFF1E3A5F), side: const BorderSide(color: Color(0xFF1E3A5F)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)), padding: const EdgeInsets.symmetric(vertical: 10)),
+                    onPressed: () => _scanEmiratesId(ImageSource.gallery),
+                  )),
+                ]),
+                if (_scanning) const Row(children: [
+                  SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)), SizedBox(width: 10),
+                  Text('Extracting details…', style: TextStyle(fontSize: 13, color: Color(0xFF1E3A5F))),
+                ]),
+                if (_scannedImage != null && !_scanning) ...[
+                  const SizedBox(height: 8),
+                  ClipRRect(borderRadius: BorderRadius.circular(10), child: Image.file(_scannedImage!, height: 120, fit: BoxFit.cover, width: double.infinity)),
+                ],
+                if (_scanConfidence != null && !_scanning) ...[
+                  const SizedBox(height: 6),
+                  Row(children: [
+                    const Icon(Icons.check_circle, color: Colors.green, size: 14), const SizedBox(width: 4),
+                    Text('Auto-filled with ${(_scanConfidence! * 100).toStringAsFixed(0)}% confidence.', style: const TextStyle(fontSize: 11, color: Colors.green)),
+                  ]),
+                ],
+                if (_scanError != null) ...[
+                  const SizedBox(height: 6),
+                  Row(children: [
+                    const Icon(Icons.warning_amber, color: Colors.red, size: 14), const SizedBox(width: 4),
+                    Expanded(child: Text(_scanError!, style: const TextStyle(fontSize: 11, color: Colors.red))),
+                  ]),
+                ],
+              ]),
+            ),
+            const SizedBox(height: 10),
+            
+            fieldLabel("Full Name *"),
+            TextFormField(controller: _nameCtrl, decoration: inputStyle(hint: "Enter full name"), validator: (v) => v == null || v.isEmpty ? "Required field" : null),
+            
+            fieldLabel("Email"),
+            TextFormField(controller: _emailCtrl, keyboardType: TextInputType.emailAddress, decoration: inputStyle(hint: "Enter email"), validator: (v) {
+              if (v == null || v.isEmpty) return null;
+              return RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$').hasMatch(v) ? null : "Invalid email address";
+            }),
+            
+            fieldLabel("Mobile Number (+971...) *"),
+            TextFormField(controller: _mobileCtrl, keyboardType: TextInputType.phone, decoration: inputStyle(hint: "+9715..."), validator: (v) {
+              if (v == null || v.isEmpty) return "Required field";
+              return RegExp(r'^\+9715[0-9]{8}$').hasMatch(v) ? null : "Must be in format +9715XXXXXXXX";
+            }),
+            
+            fieldLabel("Date of Birth *"),
+            InkWell(
+              onTap: () async {
+                final dt = await showDatePicker(context: context, initialDate: _selectedDob ?? DateTime(2000), firstDate: DateTime(1920), lastDate: DateTime.now());
+                if (dt != null) setState(() => _selectedDob = dt);
+              },
+              borderRadius: BorderRadius.circular(12),
+              child: InputDecorator(
+                decoration: inputStyle(fill: Colors.grey.shade50).copyWith(
+                  errorText: (_selectedDob == null && _f.currentState != null && !(_f.currentState!.validate())) ? "Please select a date" : null,
+                ),
+                child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                  Text(_selectedDob == null ? "Select Date" : DateFormat('dd/MM/yyyy').format(_selectedDob!), style: TextStyle(color: _selectedDob == null ? Colors.grey.shade600 : Colors.black87, fontSize: 16)),
+                  Icon(Icons.calendar_month, color: Colors.grey.shade600),
+                ]),
+              ),
+            ),
+            
+            fieldLabel("Emirates ID *"),
+            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(flex: 3, child: TextFormField(key: ValueKey(_selectedDob?.year), initialValue: "784-${_selectedDob?.year ?? 'YYYY'}-", enabled: false, decoration: inputStyle(fill: Colors.grey.shade200))),
+              const SizedBox(width: 12),
+              Expanded(flex: 5, child: TextFormField(
+                controller: _eidCtrl, decoration: inputStyle(hint: "1234567-1"), keyboardType: TextInputType.number, maxLength: 9,
+                validator: (v) => RegExp(r'^[0-9]{7}-[0-9]{1}$').hasMatch(v ?? "") ? null : "Must be XXXXXXX-X",
+                onChanged: (v) {
+                  if (v.length == 7 && !v.contains("-")) { _eidCtrl.text = "$v-"; _eidCtrl.selection = TextSelection.fromPosition(TextPosition(offset: _eidCtrl.text.length)); }
+                },
+              )),
+            ]),
+            
+            fieldLabel("Parish Number (optional)"),
+            TextFormField(controller: _parishCtrl, textCapitalization: TextCapitalization.characters, decoration: inputStyle(hint: "e.g. envelope or register number")),
+            
+            const SizedBox(height: 16),
+            SizedBox(width: double.infinity, child: ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14)),
+              onPressed: _creatingUser ? null : _createUser,
+              child: _creatingUser ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text('Create & Continue to Booking'),
+            )),
+          ]),
+          const SizedBox(height: 16),
+          _sectionCard('Or Find Existing Member', Icons.search_rounded, children: [
+            if (_searchError != null) _errorBox(_searchError!),
+            Text('Search by mobile number or email address.', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
+            const SizedBox(height: 12),
+            Row(children: [
+              Expanded(child: TextField(controller: _searchCtrl, decoration: const InputDecoration(hintText: 'Mobile or email…', border: OutlineInputBorder(), contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12)))),
+              const SizedBox(width: 10),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.grey.shade800, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 18)),
+                onPressed: _searching ? null : _searchMember,
+                child: _searching ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text('Search'),
+              ),
+            ]),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  // ── Step 1: After create — two options ─────────────────────
+  Widget _buildStep1() => SingleChildScrollView(
+    padding: const EdgeInsets.all(16),
+    child: Column(children: [
+      _memberBanner(),
+      Row(children: [
+        Expanded(child: _optionCard(icon: Icons.family_restroom_rounded, color: Colors.blue.shade700, bg: Colors.blue.shade50,
+          title: 'Add Family Member', subtitle: 'Add dependents before booking',
+          onTap: () => setState(() => _step = 2))),
+        const SizedBox(width: 12),
+        Expanded(child: _optionCard(icon: Icons.event_seat_rounded, color: Colors.green.shade700, bg: Colors.green.shade50,
+          title: 'Proceed to Booking', subtitle: 'Go straight to Mass selection',
+          onTap: () { _fetchSlots(); setState(() => _step = 3); })),
+      ]),
+    ]),
+  );
+
+  // ── Step 2: Family profiles ─────────────────────────────────
+  Widget _buildStep2() => Column(children: [
+    _memberBanner(),
+    Expanded(child: _profiles.isEmpty
+      ? Center(child: Text('No profiles found.', style: TextStyle(color: Colors.grey.shade500)))
+      : ListView.builder(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          itemCount: _profiles.length,
+          itemBuilder: (_, i) {
+            final p = _profiles[i] as Map<String, dynamic>;
+            return Card(margin: const EdgeInsets.only(bottom: 8), child: ListTile(
+              leading: CircleAvatar(backgroundColor: const Color(0xFF1E3A5F), child: Text((p['fullName']?.toString() ?? '?')[0].toUpperCase(), style: const TextStyle(color: Colors.white, fontSize: 14))),
+              title: Text('${p['fullName'] ?? ''} ${p['isPrimary'] == true ? '(Primary)' : ''}', style: const TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: Text(p['relation']?.toString() ?? ''),
+            ));
+          })),
+    Padding(padding: const EdgeInsets.all(16), child: Row(children: [
+      Expanded(child: OutlinedButton(onPressed: () => setState(() => _step = 1), child: const Text('Back'))),
+      const SizedBox(width: 12),
+      Expanded(child: ElevatedButton(
+        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white),
+        onPressed: () { _fetchSlots(); setState(() => _step = 3); },
+        child: const Text('Proceed to Booking'),
+      )),
+    ])),
+  ]);
+
+  // ── Step 3: Book mass ───────────────────────────────────────
+  Widget _buildStep3() => SingleChildScrollView(
+    padding: const EdgeInsets.all(16),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _memberBanner(),
+      if (_bookError != null) _errorBox(_bookError!),
+      _sectionCard('Select Date', Icons.calendar_today_rounded, children: [
+        CalendarDatePicker(
+          initialDate: _selectedDate, firstDate: DateTime.now(),
+          lastDate: DateTime.now().add(const Duration(days: 60)),
+          selectableDayPredicate: _allowAnyDay ? null : (d) => d.weekday == DateTime.saturday || d.weekday == DateTime.sunday,
+          onDateChanged: (d) { setState(() { _selectedDate = d; _selectedTemplateId = null; _slots = []; }); _fetchSlots(); }),
+      ]),
+      const SizedBox(height: 16),
+      _sectionCard('Select Mass Time', Icons.access_time_rounded, children: [
+        if (_loadingSlots) const Center(child: CircularProgressIndicator())
+        else if (_slots.isEmpty) Text('No masses on this date.', style: TextStyle(color: Colors.grey.shade500))
+        else Wrap(spacing: 10, runSpacing: 10, children: _slots.map((s) {
+          final id = s['_id']?.toString() ?? s['id']?.toString() ?? '';
+          final time = s['time']?.toString() ?? '';
+          final lang = s['language']?.toString() ?? '';
+          final selected = _selectedTemplateId == id;
+          return GestureDetector(
+            onTap: () => setState(() => _selectedTemplateId = id),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: selected ? const Color(0xFF1E3A5F) : Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: selected ? const Color(0xFF1E3A5F) : Colors.grey.shade300),
+                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 4)]),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(time, style: TextStyle(fontWeight: FontWeight.bold, color: selected ? Colors.white : Colors.black87)),
+                Text(lang, style: TextStyle(fontSize: 11, color: selected ? Colors.white70 : Colors.grey)),
+              ]),
+            ),
+          );
+        }).toList()),
+      ]),
+      const SizedBox(height: 16),
+      _sectionCard('Select Attendees', Icons.people_rounded, children: [
+        ..._profiles.map((p) {
+          final id = p['_id']?.toString() ?? '';
+          final checked = _selectedProfileIds.contains(id);
+          return CheckboxListTile(
+            value: checked, contentPadding: EdgeInsets.zero,
+            title: Text('${p['fullName'] ?? ''} ${p['isPrimary'] == true ? '(Primary)' : ''}', style: const TextStyle(fontWeight: FontWeight.w600)),
+            subtitle: Text(p['relation']?.toString() ?? ''),
+            onChanged: (v) => setState(() { if (v == true) _selectedProfileIds.add(id); else _selectedProfileIds.remove(id); }),
+          );
+        }),
+      ]),
+      const SizedBox(height: 20),
+      SizedBox(width: double.infinity, child: ElevatedButton(
+        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 16)),
+        onPressed: (_selectedTemplateId != null && _selectedProfileIds.isNotEmpty && !_submitting) ? _confirmBooking : null,
+        child: _submitting ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text('Confirm Booking', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+      )),
+      const SizedBox(height: 32),
+    ]),
+  );
+
+  // ── Step 4: Success ─────────────────────────────────────────
+  Widget _buildStep4() => Center(
+    child: Padding(
+      padding: const EdgeInsets.all(32),
+      child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+        Container(width: 80, height: 80, decoration: BoxDecoration(color: Colors.green.shade50, shape: BoxShape.circle),
+          child: Icon(Icons.check_circle_rounded, size: 56, color: Colors.green.shade600)),
+        const SizedBox(height: 24),
+        const Text('Booking Confirmed!', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Text('Mass booked for ${_memberName}', style: TextStyle(color: Colors.grey.shade600)),
+        const SizedBox(height: 24),
+        ..._bookingResults.map((b) => Container(
+          margin: const EdgeInsets.only(bottom: 10),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.green.shade200)),
+          child: Row(children: [
+            const Icon(Icons.qr_code_rounded, color: Color(0xFF1E3A5F), size: 28),
+            const SizedBox(width: 12),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(b['fullName']?.toString() ?? '', style: const TextStyle(fontWeight: FontWeight.bold)),
+              Text('Code: ${b['bookingCode'] ?? ''}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+            ])),
+          ]),
+        )),
+        const SizedBox(height: 32),
+        SizedBox(width: double.infinity, child: ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E3A5F), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14)),
+          onPressed: _reset,
+          child: const Text('Book for Another Member'),
+        )),
+      ]),
+    ),
+  );
+
+  // ── Helpers ─────────────────────────────────────────────────
+  Widget _sectionCard(String title, IconData icon, {required List<Widget> children}) => Container(
+    width: double.infinity, margin: const EdgeInsets.only(bottom: 0),
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 3))]),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [Icon(icon, size: 18, color: const Color(0xFF1E3A5F)), const SizedBox(width: 8), Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Color(0xFF1E3A5F)))]),
+      const SizedBox(height: 14),
+      ...children,
+    ]),
+  );
+
+  Widget _optionCard({required IconData icon, required Color color, required Color bg, required String title, required String subtitle, required VoidCallback onTap}) =>
+    GestureDetector(onTap: onTap, child: Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 8)], border: Border.all(color: Colors.grey.shade200)),
+      child: Column(children: [
+        Container(padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: bg, shape: BoxShape.circle), child: Icon(icon, color: color, size: 24)),
+        const SizedBox(height: 10),
+        Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13), textAlign: TextAlign.center),
+        const SizedBox(height: 4),
+        Text(subtitle, style: TextStyle(color: Colors.grey.shade600, fontSize: 11), textAlign: TextAlign.center),
+      ]),
+    ));
+
+  Widget _field(TextEditingController ctrl, String label, {TextInputType? type, bool required = false}) => Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: TextField(controller: ctrl, keyboardType: type, decoration: InputDecoration(
+      labelText: required ? '$label *' : label, border: const OutlineInputBorder(),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14))));
+
+  Widget _errorBox(String msg) => Container(
+    margin: const EdgeInsets.only(bottom: 12),
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.red.shade200)),
+    child: Text(msg, style: TextStyle(color: Colors.red.shade800, fontSize: 13)));
 }
 
 // ─── VOLUNTEER SECTION ──────────────────────────────────────
