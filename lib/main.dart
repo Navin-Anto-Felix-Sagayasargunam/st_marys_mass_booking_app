@@ -1133,6 +1133,34 @@ class _FamilyMemberDialogState extends State<FamilyMemberDialog> {
             ? "Other"
             : (s.relations.isNotEmpty ? s.relations.first : null));
 
+    final resolvedRForSubmit = widget.isPrimary 
+            ? (widget.member?.relation ?? 'Self') 
+            : (r ?? resolvedR ?? (s.relations.isNotEmpty ? s.relations.first : 'Other'));
+
+    bool isMinor = false;
+    if (d != null) {
+      final today = DateTime.now();
+      int age = today.year - d!.year;
+      if (today.month < d!.month || (today.month == d!.month && today.day < d!.day)) {
+        age--;
+      }
+      isMinor = age < 18;
+    }
+
+    bool isSonOrDaughter = resolvedRForSubmit == "Son" || resolvedRForSubmit == "Daughter";
+    bool autoFillContact = !widget.isPrimary && isMinor && isSonOrDaughter;
+
+    String primaryMobile = "";
+    if (s.familyMembers.isNotEmpty) {
+      primaryMobile = s.familyMembers.first.mobile;
+    }
+
+    if (autoFillContact && primaryMobile.isNotEmpty && m.text != primaryMobile) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() => m.text = primaryMobile);
+      });
+    }
+
     Widget fieldLabel(String text) => Padding(
           padding: const EdgeInsets.only(bottom: 8),
           child: Text(
@@ -1450,9 +1478,11 @@ class _FamilyMemberDialogState extends State<FamilyMemberDialog> {
                 fieldLabel("Mobile Number"),
                 TextFormField(
                   controller: m,
+                  enabled: !autoFillContact,
                   decoration: inputStyle(
-                    hint: "e.g., 971501234567",
-                    helper: "12-digit UAE number starting with 9715",
+                    hint: autoFillContact ? "Shares primary mobile" : "e.g., 971501234567",
+                    helper: autoFillContact ? "Inherited from primary profile" : "12-digit UAE number starting with 9715",
+                    fill: autoFillContact ? Colors.grey.shade200 : null,
                   ),
                   keyboardType: TextInputType.phone,
                   maxLength: 12,
@@ -1494,9 +1524,6 @@ class _FamilyMemberDialogState extends State<FamilyMemberDialog> {
                         setState(() {});
                         if (!_f.currentState!.validate() || d == null) return;
 
-                        final resolvedRForSubmit = widget.isPrimary 
-                                ? (widget.member?.relation ?? 'Self') 
-                                : (r ?? resolvedR ?? s.relations.first);
                         final dobStr = DateFormat('yyyy-MM-dd').format(d!);
                         final uaeIdStr = "784-${d!.year}-${idS.text}";
                         final parishStr = pN.text.trim();
